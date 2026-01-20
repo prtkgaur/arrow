@@ -23,6 +23,7 @@
 #include <optional>
 
 #include "arrow/util/alp/alp.h"
+#include "arrow/util/alp/alp_rd.h"
 
 namespace arrow {
 namespace util {
@@ -36,15 +37,25 @@ namespace alp {
 ///
 /// AlpWrapper is an interface for Adaptive Lossless floating-Point Compression
 /// (ALP) (https://dl.acm.org/doi/10.1145/3626717). For encoding, it samples
-/// the data and applies decimal compression (Alp) to floating point values.
-/// This class acts as a wrapper around the vector-based interfaces of
-/// AlpSampler and Alp.
+/// the data and applies either decimal compression (ALP) or real-doubles
+/// compression (ALP-RD) based on estimated compression ratios.
+///
+/// ALP supports two compression modes:
+///   - kAlp: Decimal compression for pseudo-decimal floating-point values
+///   - kAlpRd: Real doubles compression via bit-split + dictionary encoding
+///
+/// The appropriate mode is automatically selected during encoding unless
+/// explicitly overridden via the enforce_mode parameter.
 ///
 /// \tparam T the floating point type (float or double)
 template <typename T>
 class AlpWrapper {
  public:
-  /// \brief Encode floating point values using ALP decimal compression
+  /// \brief Encode floating point values using ALP compression
+  ///
+  /// Samples the input data and selects the best compression mode (ALP or
+  /// ALP-RD) based on estimated compression ratios. The mode can be overridden
+  /// using the enforce_mode parameter.
   ///
   /// \param[in] decomp pointer to the input that is to be encoded
   /// \param[in] decomp_size size of decomp in bytes.
@@ -54,13 +65,17 @@ class AlpWrapper {
   /// \param[in,out] comp_size the actual size of the encoded data in bytes,
   ///                expects the size of comp as input. If this is too small,
   ///                this is set to 0 and we bail out.
-  /// \param[in] enforce_mode reserved for future use.
-  ///            Currently only AlpMode::kAlp is supported.
+  /// \param[in] enforce_mode if provided, forces the specified compression mode.
+  ///            If nullopt, the mode is automatically selected based on
+  ///            estimated compression ratios.
   static void Encode(const T* decomp, size_t decomp_size, char* comp,
                      size_t* comp_size,
                      std::optional<AlpMode> enforce_mode = std::nullopt);
 
   /// \brief Decode floating point values
+  ///
+  /// Automatically detects the compression mode from the header and applies
+  /// the appropriate decompression algorithm.
   ///
   /// \param[out] decomp pointer to the memory region we will decode into.
   ///             The caller is responsible for ensuring this is big enough
@@ -76,6 +91,9 @@ class AlpWrapper {
                      size_t comp_size);
 
   /// \brief Get the maximum compressed size of an uncompressed buffer
+  ///
+  /// Returns the maximum possible compressed size assuming worst case for
+  /// both ALP and ALP-RD modes.
   ///
   /// \param[in] decomp_size the size of the uncompressed buffer in bytes
   /// \return the maximum size of the compressed buffer
@@ -104,7 +122,7 @@ class AlpWrapper {
     uint64_t num_compressed_bytes_taken = 0;
   };
 
-  /// \brief Compress a buffer using the ALP variant
+  /// \brief Compress a buffer using the ALP decimal compression
   ///
   /// \param[in] decomp array of floating point numbers to compress
   /// \param[in] element_count the number of floating point numbers
@@ -116,7 +134,19 @@ class AlpWrapper {
                                        char* comp, size_t comp_size,
                                        const AlpEncodingPreset& combinations);
 
-  /// \brief Decompress a buffer using the ALP variant
+  /// \brief Compress a buffer using the ALP-RD real-doubles compression
+  ///
+  /// \param[in] decomp array of floating point numbers to compress
+  /// \param[in] element_count the number of floating point numbers
+  /// \param[out] comp the buffer to be compressed into
+  /// \param[in] comp_size the size of the compression buffer
+  /// \param[in] preset the ALP-RD encoding preset to use
+  /// \return the compression progress
+  static CompressionProgress EncodeAlpRd(const T* decomp, uint64_t element_count,
+                                         char* comp, size_t comp_size,
+                                         const AlpRdEncodingPreset& preset);
+
+  /// \brief Decompress a buffer using the ALP decimal compression
   ///
   /// \param[out] decomp the buffer to be decompressed into
   /// \param[in] decomp_element_count the number of floats to decompress
@@ -134,6 +164,25 @@ class AlpWrapper {
                                          const char* comp, size_t comp_size,
                                          AlpIntegerEncoding integer_encoding,
                                          uint32_t vector_size, uint32_t total_elements);
+
+  /// \brief Decompress a buffer using the ALP-RD real-doubles compression
+  ///
+  /// \param[out] decomp the buffer to be decompressed into
+  /// \param[in] decomp_element_count the number of floats to decompress
+  /// \param[in] comp the compressed buffer to be decompressed
+  /// \param[in] comp_size the size of the compressed data
+  /// \param[in] settings the ALP-RD encoding settings (dictionary)
+  /// \param[in] vector_size the number of elements per vector (from header)
+  /// \param[in] total_elements the total number of elements in the page (from header).
+  /// \return the decompression progress
+  /// \tparam TargetType the type that is used to store the output.
+  template <typename TargetType>
+  static DecompressionProgress DecodeAlpRd(TargetType* decomp,
+                                           size_t decomp_element_count,
+                                           const char* comp, size_t comp_size,
+                                           const AlpRdEncodingSettings& settings,
+                                           uint32_t vector_size,
+                                           uint32_t total_elements);
 
   /// \brief Load the AlpHeader from compressed data
   ///

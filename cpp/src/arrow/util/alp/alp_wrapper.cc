@@ -18,10 +18,12 @@
 #include "arrow/util/alp/alp_wrapper.h"
 
 #include <cmath>
+#include <cstring>
 #include <optional>
 
 #include "arrow/util/alp/alp.h"
 #include "arrow/util/alp/alp_constants.h"
+#include "arrow/util/alp/alp_rd.h"
 #include "arrow/util/alp/alp_sampler.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/ubsan.h"
@@ -52,7 +54,7 @@ namespace {
 /// Header format (version 1):
 ///
 ///   +---------------------------------------------------+
-///   |  AlpHeader (8 bytes)                              |
+///   |  AlpHeader (8 bytes fixed)                        |
 ///   +---------------------------------------------------+
 ///   |  Offset |  Field              |  Size             |
 ///   +---------+---------------------+-------------------+
@@ -63,17 +65,33 @@ namespace {
 ///   |    4    |  num_elements       |  4 bytes (uint32) |
 ///   +---------------------------------------------------+
 ///
+/// For ALP-RD mode, the header is followed by the dictionary:
+///   +---------------------------------------------------+
+///   |  AlpRdEncodingSettings (variable)                 |
+///   |  [left_bit_width | right_bit_width | num_dict_entries | dictionary...]
+///   +---------------------------------------------------+
+///
 /// Page-level layout (metadata-at-start for efficient random access):
 ///
+///   ALP mode:
 ///   +-------------------------------------------------------------------+
 ///   |  [AlpHeader (8B)]                                                 |
-///   |  [VectorInfo₀ | VectorInfo₁ | ... | VectorInfoₙ]  ← Metadata      |
-///   |  [Data₀ | Data₁ | ... | Dataₙ]                    ← Data sections |
+///   |  [AlpInfo₀ | AlpInfo₁ | ... | AlpInfoₙ]       ← ALP metadata      |
+///   |  [ForInfo₀ | ForInfo₁ | ... | ForInfoₙ]       ← FOR metadata      |
+///   |  [Data₀ | Data₁ | ... | Dataₙ]                ← Data sections     |
+///   +-------------------------------------------------------------------+
+///
+///   ALP-RD mode:
+///   +-------------------------------------------------------------------+
+///   |  [AlpHeader (8B)]                                                 |
+///   |  [AlpRdEncodingSettings (variable)]           ← Dictionary        |
+///   |  [AlpRdMeta₀ | AlpRdMeta₁ | ... | AlpRdMetaₙ] ← Per-vector meta   |
+///   |  [Data₀ | Data₁ | ... | Dataₙ]                ← Data sections     |
 ///   +-------------------------------------------------------------------+
 ///
 /// This layout enables O(1) random access to any vector by:
-/// 1. Reading all VectorInfo first (contiguous, cache-friendly)
-/// 2. Computing data offsets from VectorInfo
+/// 1. Reading all metadata first (contiguous, cache-friendly)
+/// 2. Computing data offsets from metadata
 /// 3. Seeking directly to the target vector's data
 ///
 /// \note version must remain the first field to allow reading the rest
@@ -81,9 +99,9 @@ namespace {
 struct AlpHeader {
   /// Version number. Must remain the first field for version-based parsing.
   uint8_t version = 0;
-  /// Compression mode (currently only kAlp is supported).
+  /// Compression mode (kAlp or kAlpRd).
   uint8_t compression_mode = static_cast<uint8_t>(AlpMode::kAlp);
-  /// Integer encoding method used (currently only kForBitPack is supported).
+  /// Integer encoding method used (for ALP mode, currently only kForBitPack).
   uint8_t integer_encoding = static_cast<uint8_t>(AlpIntegerEncoding::kForBitPack);
   /// Log base 2 of vector size. Actual vector size = 1u << log_vector_size.
   /// For example: 10 means 2^10 = 1024 elements per vector.
@@ -92,12 +110,12 @@ struct AlpHeader {
   /// Per-vector element count is inferred: vector_size for all but the last vector.
   uint32_t num_elements = 0;
 
-  /// \brief Get the size in bytes of the AlpHeader for a version
+  /// \brief Get the fixed size in bytes of the AlpHeader for a version
   ///
   /// \param[in] v the version number
   /// \return the size in bytes
-  static constexpr size_t GetSizeForVersion(uint8_t v) {
-    // Version 1 header is 8 bytes
+  static constexpr size_t GetFixedSizeForVersion(uint8_t v) {
+    // Version 1 header is 8 bytes (fixed portion)
     return (v == 1) ? 8 : 0;
   }
 
@@ -162,20 +180,19 @@ struct AlpHeader {
 // AlpWrapper::AlpHeader definition
 
 template <typename T>
-struct AlpWrapper<T>::AlpHeader : public ::arrow::util::alp::AlpHeader {
-};
+struct AlpWrapper<T>::AlpHeader : public ::arrow::util::alp::AlpHeader {};
 
 // ----------------------------------------------------------------------
 // AlpWrapper implementation
 
 template <typename T>
-typename AlpWrapper<T>::AlpHeader AlpWrapper<T>::LoadHeader(
-    const char* comp, size_t comp_size) {
+typename AlpWrapper<T>::AlpHeader AlpWrapper<T>::LoadHeader(const char* comp,
+                                                           size_t comp_size) {
   ARROW_CHECK(comp_size >= 1) << "alp_loadHeader_compSize_too_small_for_version";
   uint8_t version;
   std::memcpy(&version, comp, sizeof(version));
   AlpHeader::IsValidVersion(version);
-  const size_t header_size = AlpHeader::GetSizeForVersion(version);
+  const size_t header_size = AlpHeader::GetFixedSizeForVersion(version);
   ARROW_CHECK(comp_size >= header_size) << "alp_loadHeader_compSize_too_small";
   AlpHeader header{};
   std::memcpy(&header, comp, header_size);
@@ -187,32 +204,68 @@ void AlpWrapper<T>::Encode(const T* decomp, size_t decomp_size, char* comp,
                            size_t* comp_size, std::optional<AlpMode> enforce_mode) {
   ARROW_CHECK(decomp_size % sizeof(T) == 0) << "alp_encode_input_must_be_multiple_of_T";
   const uint64_t element_count = decomp_size / sizeof(T);
-  const uint8_t version =
-      AlpHeader::IsValidVersion(AlpConstants::kAlpVersion);
+  const uint8_t version = AlpHeader::IsValidVersion(AlpConstants::kAlpVersion);
 
   AlpSampler<T> sampler;
   sampler.AddSample({decomp, element_count});
-  auto sampling_result = sampler.Finalize();
+  auto sampling_result = sampler.Finalize(/*always_generate_alp_rd_preset=*/true);
+
+  // Determine which mode to use
+  AlpMode mode = enforce_mode.value_or(sampling_result.recommendation);
 
   // Make room to store header afterwards.
   char* encoded_header = comp;
-  const size_t header_size = AlpHeader::GetSizeForVersion(version);
-  comp += header_size;
-  const uint64_t remaining_compressed_size = *comp_size - header_size;
-
-  const CompressionProgress compression_progress =
-      EncodeAlp(decomp, element_count, comp, remaining_compressed_size,
-                sampling_result.alp_preset);
+  const size_t fixed_header_size = AlpHeader::GetFixedSizeForVersion(version);
 
   AlpHeader header{};
   header.version = version;
-  header.compression_mode = static_cast<uint8_t>(AlpMode::kAlp);
-  header.integer_encoding = static_cast<uint8_t>(AlpIntegerEncoding::kForBitPack);
+  header.compression_mode = static_cast<uint8_t>(mode);
   header.log_vector_size = AlpHeader::Log2(AlpConstants::kAlpVectorSize);
   header.num_elements = static_cast<uint32_t>(element_count);
 
-  std::memcpy(encoded_header, &header, header_size);
-  *comp_size = header_size + compression_progress.num_compressed_bytes_produced;
+  CompressionProgress compression_progress;
+
+  if (mode == AlpMode::kAlp) {
+    header.integer_encoding = static_cast<uint8_t>(AlpIntegerEncoding::kForBitPack);
+
+    // Write fixed header
+    std::memcpy(encoded_header, &header, fixed_header_size);
+
+    char* comp_body = comp + fixed_header_size;
+    const uint64_t remaining_compressed_size = *comp_size - fixed_header_size;
+
+    compression_progress =
+        EncodeAlp(decomp, element_count, comp_body, remaining_compressed_size,
+                  sampling_result.alp_preset);
+
+    *comp_size = fixed_header_size + compression_progress.num_compressed_bytes_produced;
+  } else {
+    // ALP-RD mode
+    ARROW_CHECK(sampling_result.alp_rd_preset.has_value())
+        << "alp_encode_alp_rd_preset_missing";
+
+    const AlpRdEncodingPreset& preset = sampling_result.alp_rd_preset.value();
+
+    // Write fixed header
+    std::memcpy(encoded_header, &header, fixed_header_size);
+
+    // Write dictionary (settings) after header
+    const uint64_t settings_size = preset.GetStoredSize();
+    char* settings_ptr = comp + fixed_header_size;
+    ARROW_CHECK(*comp_size >= fixed_header_size + settings_size)
+        << "alp_encode_comp_too_small_for_settings";
+    preset.Store({settings_ptr, settings_size});
+
+    char* comp_body = comp + fixed_header_size + settings_size;
+    const uint64_t remaining_compressed_size =
+        *comp_size - fixed_header_size - settings_size;
+
+    compression_progress =
+        EncodeAlpRd(decomp, element_count, comp_body, remaining_compressed_size, preset);
+
+    *comp_size = fixed_header_size + settings_size +
+                 compression_progress.num_compressed_bytes_produced;
+  }
 }
 
 template <typename T>
@@ -224,16 +277,30 @@ void AlpWrapper<T>::Decode(TargetType* decomp, uint32_t num_elements, const char
   ARROW_CHECK(vector_size == AlpConstants::kAlpVectorSize)
       << "unsupported_vector_size: " << vector_size;
 
-  const size_t header_size = AlpHeader::GetSizeForVersion(header.version);
-  const char* compression_body = comp + header_size;
-  const uint64_t compression_body_size = comp_size - header_size;
+  const size_t fixed_header_size = AlpHeader::GetFixedSizeForVersion(header.version);
+  const AlpMode mode = header.GetCompressionMode();
 
-  ARROW_CHECK(header.GetCompressionMode() == AlpMode::kAlp)
-      << "alp_decode_unsupported_mode";
+  if (mode == AlpMode::kAlp) {
+    const char* compression_body = comp + fixed_header_size;
+    const uint64_t compression_body_size = comp_size - fixed_header_size;
 
-  DecodeAlp<TargetType>(decomp, num_elements, compression_body, compression_body_size,
-                        header.GetIntegerEncoding(), vector_size,
-                        header.num_elements);
+    DecodeAlp<TargetType>(decomp, num_elements, compression_body, compression_body_size,
+                          header.GetIntegerEncoding(), vector_size,
+                          header.num_elements);
+  } else {
+    // ALP-RD mode
+    // Load dictionary (settings) from after header
+    const char* settings_ptr = comp + fixed_header_size;
+    const AlpRdEncodingSettings settings = AlpRdEncodingSettings::Load(
+        {settings_ptr, comp_size - fixed_header_size});
+    const uint64_t settings_size = settings.GetStoredSize();
+
+    const char* compression_body = comp + fixed_header_size + settings_size;
+    const uint64_t compression_body_size = comp_size - fixed_header_size - settings_size;
+
+    DecodeAlpRd<TargetType>(decomp, num_elements, compression_body, compression_body_size,
+                            settings, vector_size, header.num_elements);
+  }
 }
 
 template void AlpWrapper<float>::Decode(float* decomp, uint32_t num_elements,
@@ -248,17 +315,26 @@ uint64_t AlpWrapper<T>::GetMaxCompressedSize(uint64_t decomp_size) {
   ARROW_CHECK(decomp_size % sizeof(T) == 0)
       << "alp_decompressed_size_not_multiple_of_T";
   const uint64_t element_count = decomp_size / sizeof(T);
-  const uint8_t version =
-      AlpHeader::IsValidVersion(AlpConstants::kAlpVersion);
-  uint64_t max_alp_size = AlpHeader::GetSizeForVersion(version);
-  // Add per-vector metadata sizes: AlpInfo (4 bytes) + ForInfo (6/10 bytes)
-  const uint64_t vectors_count =
-      static_cast<uint64_t>(std::ceil(static_cast<double>(element_count) / AlpConstants::kAlpVectorSize));
-  max_alp_size +=
-      (AlpEncodedVectorInfo::kStoredSize + AlpEncodedForVectorInfo<T>::kStoredSize) * vectors_count;
-  // Worst case: everything is an exception, except two values that are chosen
-  // with large difference to make FOR encoding for placeholders impossible.
-  // Values/placeholders.
+  const uint8_t version = AlpHeader::IsValidVersion(AlpConstants::kAlpVersion);
+  uint64_t max_alp_size = AlpHeader::GetFixedSizeForVersion(version);
+
+  // Add max dictionary size for ALP-RD (worst case)
+  const uint64_t max_dict_size =
+      AlpRdConstants::GetMaxDictionarySize(AlpRdConstants::kDefaultMaxDictionaryBitWidth) *
+          sizeof(uint16_t) +
+      AlpRdEncodingSettings::GetFixedStoredSize();
+  max_alp_size += max_dict_size;
+
+  // Add per-vector metadata sizes (take max of ALP and ALP-RD)
+  const uint64_t vectors_count = static_cast<uint64_t>(
+      std::ceil(static_cast<double>(element_count) / AlpConstants::kAlpVectorSize));
+  const uint64_t alp_meta_per_vector =
+      AlpEncodedVectorInfo::kStoredSize + AlpEncodedForVectorInfo<T>::kStoredSize;
+  const uint64_t alp_rd_meta_per_vector = AlpRdVectorMetadata::GetStoredSize();
+  max_alp_size += std::max(alp_meta_per_vector, alp_rd_meta_per_vector) * vectors_count;
+
+  // Worst case data: everything is an exception
+  // Values/placeholders (max of both encoding methods)
   max_alp_size += element_count * sizeof(T);
   // Exceptions.
   max_alp_size += element_count * sizeof(T);
@@ -349,20 +425,86 @@ auto AlpWrapper<T>::EncodeAlp(const T* decomp, uint64_t element_count, char* com
 }
 
 template <typename T>
+auto AlpWrapper<T>::EncodeAlpRd(const T* decomp, uint64_t element_count, char* comp,
+                                size_t comp_size, const AlpRdEncodingPreset& preset)
+    -> CompressionProgress {
+  using ExactType = typename AlpTypedConstants<T>::FloatingToExact;
+
+  // GROUPED METADATA LAYOUT for ALP-RD:
+  // [AlpRdVectorMetadata₀ | AlpRdVectorMetadata₁ | ... | AlpRdVectorMetadataₙ]
+  // [Data₀ | Data₁ | ... | Dataₙ]
+
+  // Phase 1: Compress all vectors and collect them
+  std::vector<AlpRdEncodedVector<T>> encoded_vectors;
+  const uint64_t num_vectors =
+      (element_count + AlpRdConstants::kAlpVectorSize - 1) / AlpRdConstants::kAlpVectorSize;
+  encoded_vectors.reserve(num_vectors);
+
+  uint64_t input_offset = 0;
+  for (uint64_t remaining_elements = element_count; remaining_elements > 0;
+       remaining_elements -=
+       std::min(static_cast<uint64_t>(AlpRdConstants::kAlpVectorSize), remaining_elements)) {
+    const uint64_t elements_to_encode =
+        std::min(static_cast<uint64_t>(AlpRdConstants::kAlpVectorSize), remaining_elements);
+
+    // Convert float array to exact (integer) representation for compression
+    // ALP-RD works on the bit representation, not the float values
+    const ExactType* input_as_exact =
+        reinterpret_cast<const ExactType*>(decomp + input_offset);
+
+    encoded_vectors.push_back(
+        AlpRdCompression<T>::CompressVector(input_as_exact, elements_to_encode, preset));
+    input_offset += elements_to_encode;
+  }
+
+  // Calculate total size needed
+  const uint64_t total_metadata_size =
+      encoded_vectors.size() * AlpRdVectorMetadata::GetStoredSize();
+  uint64_t total_data_size = 0;
+  for (const auto& vec : encoded_vectors) {
+    total_data_size += vec.GetDataSize();
+  }
+  const uint64_t total_size = total_metadata_size + total_data_size;
+
+  if (total_size > comp_size) {
+    return CompressionProgress{0, 0};
+  }
+
+  // Phase 2: Write all metadata first
+  uint64_t metadata_offset = 0;
+  for (const auto& vec : encoded_vectors) {
+    const AlpRdVectorMetadata meta = vec.GetVectorMetadata();
+    meta.Store({comp + metadata_offset, AlpRdVectorMetadata::GetStoredSize()});
+    metadata_offset += AlpRdVectorMetadata::GetStoredSize();
+  }
+
+  // Phase 3: Write all data sections consecutively
+  uint64_t data_offset = total_metadata_size;
+  for (const auto& vec : encoded_vectors) {
+    const uint64_t data_size = vec.GetDataSize();
+    vec.StoreDataOnly({comp + data_offset, data_size});
+    data_offset += data_size;
+  }
+
+  ARROW_CHECK(data_offset == total_size)
+      << "alprd_encode_size_mismatch: " << data_offset << " vs " << total_size;
+
+  return CompressionProgress{total_size, element_count};
+}
+
+template <typename T>
 template <typename TargetType>
 auto AlpWrapper<T>::DecodeAlp(TargetType* decomp, size_t decomp_element_count,
                               const char* comp, size_t comp_size,
-                              AlpIntegerEncoding integer_encoding,
-                              uint32_t vector_size, uint32_t total_elements)
-    -> DecompressionProgress {
+                              AlpIntegerEncoding integer_encoding, uint32_t vector_size,
+                              uint32_t total_elements) -> DecompressionProgress {
   // GROUPED METADATA LAYOUT:
   // [AlpInfo₀ | AlpInfo₁ | ... | AlpInfoₙ]     ← All ALP metadata (4B each)
   // [IntEncodingInfo₀ | ... | IntEncodingInfoₙ] ← Integer encoding metadata (varies by type)
   // [Data₀ | Data₁ | ... | Dataₙ]               ← All data sections
 
   // Calculate number of vectors
-  const uint32_t num_vectors =
-      (total_elements + vector_size - 1) / vector_size;
+  const uint32_t num_vectors = (total_elements + vector_size - 1) / vector_size;
 
   if (num_vectors == 0) {
     return DecompressionProgress{0, 0};
@@ -371,8 +513,10 @@ auto AlpWrapper<T>::DecodeAlp(TargetType* decomp, size_t decomp_element_count,
   const uint64_t total_alp_info_size =
       static_cast<uint64_t>(num_vectors) * AlpEncodedVectorInfo::kStoredSize;
   const uint64_t total_int_encoding_info_size =
-      static_cast<uint64_t>(num_vectors) * GetIntegerEncodingMetadataSize<T>(integer_encoding);
-  const uint64_t total_metadata_size = total_alp_info_size + total_int_encoding_info_size;
+      static_cast<uint64_t>(num_vectors) *
+      GetIntegerEncodingMetadataSize<T>(integer_encoding);
+  const uint64_t total_metadata_size =
+      total_alp_info_size + total_int_encoding_info_size;
 
   ARROW_CHECK(comp_size >= total_metadata_size)
       << "alp_decode_comp_size_too_small_for_metadata: " << comp_size << " vs "
@@ -400,7 +544,8 @@ auto AlpWrapper<T>::DecodeAlp(TargetType* decomp, size_t decomp_element_count,
     // Decode based on integer encoding type
     switch (integer_encoding) {
       case AlpIntegerEncoding::kForBitPack: {
-        // Use LoadViewDataOnly since AlpInfo and ForInfo are stored separately in the cache
+        // Use LoadViewDataOnly since AlpInfo and ForInfo are stored separately in the
+        // cache
         const uint64_t data_offset = cache.GetVectorDataOffset(vector_index);
         const AlpEncodedVectorView<T> encoded_view =
             AlpEncodedVectorView<T>::LoadViewDataOnly(
@@ -421,7 +566,70 @@ auto AlpWrapper<T>::DecodeAlp(TargetType* decomp, size_t decomp_element_count,
     output_offset += this_vector_elements;
   }
 
-  return DecompressionProgress{output_offset, total_metadata_size + cache.GetTotalDataSize()};
+  return DecompressionProgress{output_offset,
+                               total_metadata_size + cache.GetTotalDataSize()};
+}
+
+template <typename T>
+template <typename TargetType>
+auto AlpWrapper<T>::DecodeAlpRd(TargetType* decomp, size_t decomp_element_count,
+                                const char* comp, size_t comp_size,
+                                const AlpRdEncodingSettings& settings,
+                                uint32_t vector_size, uint32_t total_elements)
+    -> DecompressionProgress {
+  // GROUPED METADATA LAYOUT for ALP-RD:
+  // [AlpRdVectorMetadata₀ | AlpRdVectorMetadata₁ | ... | AlpRdVectorMetadataₙ]
+  // [Data₀ | Data₁ | ... | Dataₙ]
+
+  // Calculate number of vectors
+  const uint32_t num_vectors = (total_elements + vector_size - 1) / vector_size;
+
+  if (num_vectors == 0) {
+    return DecompressionProgress{0, 0};
+  }
+
+  const uint64_t total_metadata_size =
+      static_cast<uint64_t>(num_vectors) * AlpRdVectorMetadata::GetStoredSize();
+
+  ARROW_CHECK(comp_size >= total_metadata_size)
+      << "alprd_decode_comp_size_too_small_for_metadata: " << comp_size << " vs "
+      << total_metadata_size;
+
+  // Load all metadata into cache
+  const AlpRdMetadataCache<T> cache = AlpRdMetadataCache<T>::Load(
+      num_vectors, vector_size, total_elements, {comp, total_metadata_size});
+
+  // Pointer to start of data section
+  const char* data_section = comp + total_metadata_size;
+  const size_t data_section_size = comp_size - total_metadata_size;
+
+  // Decode each vector using the cache
+  uint64_t output_offset = 0;
+  for (uint32_t vector_index = 0; vector_index < cache.GetNumVectors(); vector_index++) {
+    const uint16_t this_vector_elements = cache.GetVectorNumElements(vector_index);
+
+    ARROW_CHECK(output_offset + this_vector_elements <= decomp_element_count)
+        << "alprd_decode_output_too_small: " << output_offset << " vs "
+        << this_vector_elements << " vs " << decomp_element_count;
+
+    // Create view from separate metadata and data sections
+    const uint64_t data_offset = cache.GetVectorDataOffset(vector_index);
+    const char* metadata_ptr =
+        comp + vector_index * AlpRdVectorMetadata::GetStoredSize();
+    const char* data_ptr = data_section + data_offset;
+
+    const AlpRdEncodedVectorView<T> view =
+        AlpRdEncodedVectorView<T>::LoadViewFromSeparateSections(
+            metadata_ptr, data_ptr, this_vector_elements, settings);
+
+    AlpRdCompression<T>::DecompressVectorView(view, decomp + output_offset,
+                                              this_vector_elements);
+
+    output_offset += this_vector_elements;
+  }
+
+  return DecompressionProgress{output_offset,
+                               total_metadata_size + cache.GetTotalDataSize()};
 }
 
 // ----------------------------------------------------------------------
