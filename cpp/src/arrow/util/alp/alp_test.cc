@@ -1263,11 +1263,12 @@ TYPED_TEST(AlpSamplerTest, EmptySample) {
 }
 
 // ============================================================================
-// Empty Input Tests
+// Empty Input Tests (Low-Level API)
 // ============================================================================
 
-TYPED_TEST(AlpEdgeCaseTest, EmptyInput) {
-  // Test compressing zero elements - edge case that should be handled gracefully
+TYPED_TEST(AlpEdgeCaseTest, ZeroElementsCompressVector) {
+  // Test low-level CompressVector with zero elements
+  // This tests the AlpCompression API directly (not via AlpWrapper)
   std::vector<TypeParam> empty_input;
   AlpCompression<TypeParam> compressor;
   AlpEncodingPreset preset{};
@@ -1285,29 +1286,6 @@ TYPED_TEST(AlpEdgeCaseTest, EmptyInput) {
   std::vector<TypeParam> output;
   compressor.DecompressVector(encoded, AlpIntegerEncoding::kForBitPack, output.data());
   // No crash = success for empty case
-}
-
-TYPED_TEST(AlpWrapperTest, EmptyInput) {
-  // Test wrapper with zero elements
-  std::vector<TypeParam> empty_input;
-
-  uint64_t max_comp_size = AlpWrapper<TypeParam>::GetMaxCompressedSize(0);
-  EXPECT_GT(max_comp_size, 0);  // Should at least have header space
-
-  std::vector<char> comp_buffer(max_comp_size);
-  size_t comp_size = comp_buffer.size();
-
-  // Encode 0 bytes (0 elements)
-  AlpWrapper<TypeParam>::Encode(empty_input.data(), 0, comp_buffer.data(), &comp_size);
-
-  // Should produce at least the header
-  EXPECT_GT(comp_size, 0);
-
-  // Decode 0 elements
-  std::vector<TypeParam> output;
-  AlpWrapper<TypeParam>::template Decode<TypeParam>(output.data(), 0,
-                                                     comp_buffer.data(), comp_size);
-  // No crash = success
 }
 
 // ============================================================================

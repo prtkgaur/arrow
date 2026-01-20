@@ -107,6 +107,7 @@ add_arrow_test(alp-test
                SOURCES
                alp/alp_test.cc
                alp/alp.cc
+               alp/alp_rd.cc
                alp/alp_sampler.cc
                alp/alp_wrapper.cc)
 

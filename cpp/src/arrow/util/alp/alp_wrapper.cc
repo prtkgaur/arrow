@@ -213,6 +213,7 @@ void AlpWrapper<T>::Encode(const T* decomp, size_t decomp_size, char* comp,
   // Determine which mode to use
   AlpMode mode = enforce_mode.value_or(sampling_result.recommendation);
 
+
   // Make room to store header afterwards.
   char* encoded_header = comp;
   const size_t fixed_header_size = AlpHeader::GetFixedSizeForVersion(version);
@@ -368,6 +369,7 @@ auto AlpWrapper<T>::EncodeAlp(const T* decomp, uint64_t element_count, char* com
         decomp + input_offset, static_cast<uint16_t>(elements_to_encode), combinations));
     input_offset += elements_to_encode;
   }
+
 
   // Calculate total size needed based on integer encoding
   const AlpIntegerEncoding integer_encoding = combinations.integer_encoding;

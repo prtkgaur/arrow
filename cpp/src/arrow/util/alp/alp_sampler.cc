@@ -117,6 +117,7 @@ AlpSamplerResult AlpSampler<T>::Finalize(const bool always_generate_alp_rd_prese
              sample_stored_)
           : std::numeric_limits<double>::max();
 
+
   // Generate ALP-RD preset and compare
   double alp_rd_bits_per_value = std::numeric_limits<double>::max();
   {
@@ -137,6 +138,7 @@ AlpSamplerResult AlpSampler<T>::Finalize(const bool always_generate_alp_rd_prese
         AlpRdCompression<T>::CreateEncodingPreset(flattened_rowgroup_sample);
     alp_rd_bits_per_value = result.alp_rd_preset.value().best_bits_per_value;
 
+
     ARROW_LOG(DEBUG) << "AlpSampler ALP-RD preset: "
                      << "leftBitWidth="
                      << static_cast<int>(result.alp_rd_preset.value().left_bit_width)
@@ -147,7 +149,9 @@ AlpSamplerResult AlpSampler<T>::Finalize(const bool always_generate_alp_rd_prese
   }
 
   // Determine recommendation based on estimated bits per value
-  if (always_generate_alp_rd_preset || (alp_bits_per_value > alp_rd_bits_per_value)) {
+  // Note: always_generate_alp_rd_preset only controls whether to keep the preset,
+  // not which mode to recommend. The recommendation is purely based on compression.
+  if (alp_rd_bits_per_value < alp_bits_per_value) {
     result.recommendation = AlpMode::kAlpRd;
     ARROW_LOG(DEBUG) << "AlpSampler recommendation: ALP-RD (alpBpv="
                      << alp_bits_per_value << ", alpRdBpv=" << alp_rd_bits_per_value

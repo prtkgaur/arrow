@@ -346,9 +346,22 @@ uint64_t AlpRdEncodedVector<T>::GetMaxStoredSize(uint8_t max_dictionary_bit_widt
 template <typename T>
 bool AlpRdEncodedVector<T>::operator==(const AlpRdEncodedVector<T>& other) const {
   const bool vector_info_equal = vector_info == other.vector_info;
-  const bool left_bit_packed_data_equal = left_parts_encoded == other.left_parts_encoded;
+
+  // Compare StaticVector contents manually since StaticVector doesn't have operator==
+  const bool left_size_equal = left_parts_encoded.size() == other.left_parts_encoded.size();
+  const bool left_bit_packed_data_equal =
+      left_size_equal &&
+      (left_parts_encoded.empty() ||
+       std::memcmp(left_parts_encoded.data(), other.left_parts_encoded.data(),
+                   left_parts_encoded.size()) == 0);
+
+  const bool right_size_equal =
+      right_parts_encoded.size() == other.right_parts_encoded.size();
   const bool right_bit_packed_data_equal =
-      right_parts_encoded == other.right_parts_encoded;
+      right_size_equal &&
+      (right_parts_encoded.empty() ||
+       std::memcmp(right_parts_encoded.data(), other.right_parts_encoded.data(),
+                   right_parts_encoded.size()) == 0);
 
   return vector_info_equal && left_bit_packed_data_equal && right_bit_packed_data_equal;
 }
@@ -610,7 +623,11 @@ AlpRdEncodedVectorView<T> AlpRdEncodedVectorView<T>::LoadViewFromSeparateSection
               sizeof(right_bit_packed_size));
 
   // Populate vector_info directly
+  // Start with page-level settings (contains dictionary) but override bit widths
+  // with per-vector values since they may differ
   view.vector_info.settings = settings;
+  view.vector_info.settings.left_bit_width = left_bit_width;
+  view.vector_info.settings.right_bit_width = right_bit_width;
   view.vector_info.left_bit_packed_size = left_bit_packed_size;
   view.vector_info.right_bit_packed_size = right_bit_packed_size;
   view.vector_info.num_exceptions = num_exceptions;
