@@ -132,8 +132,20 @@ namespace alp {
 
 /// \brief ALP compression mode
 ///
-/// Currently only ALP (decimal compression) is implemented.
-enum class AlpMode { kAlp };
+/// ALP supports two compression modes:
+///   - kAlp: Decimal compression for pseudo-decimal floating-point values.
+///           Works by converting floats to integers via decimal encoding.
+///   - kAlpRd: "Real Doubles" compression for floating-point values that
+///             cannot be efficiently encoded as decimals. Works by splitting
+///             the bit representation into left (high) and right (low) parts,
+///             dictionary-encoding the left parts, and bit-packing both.
+///
+/// The appropriate mode is determined during the sampling phase by comparing
+/// the estimated compression ratios of both methods.
+enum class AlpMode : uint8_t {
+  kAlp = 0,    // Decimal compression (pseudo-decimals)
+  kAlpRd = 1   // Real doubles (bit-split + dictionary)
+};
 
 // ----------------------------------------------------------------------
 // AlpExponentAndFactor
