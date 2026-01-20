@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "arrow/util/alp/alp.h"
+#include "arrow/util/alp/alp_rd.h"
 #include "arrow/util/span.h"
 
 namespace arrow {
@@ -30,13 +31,57 @@ namespace util {
 namespace alp {
 
 // ----------------------------------------------------------------------
+// AlpSamplerResult
+
+/// \brief Result from ALP sampling containing the recommended mode and presets
+///
+/// This struct is returned by AlpSampler::Finalize() and contains:
+///   - recommendation: Which compression mode (ALP or ALP-RD) to use
+///   - alp_preset: The encoding preset for ALP decimal compression
+///   - alp_rd_preset: The encoding preset for ALP-RD (if generated)
+///
+/// The recommendation is based on comparing the estimated compression ratios
+/// of both methods. ALP is preferred when it achieves better compression,
+/// otherwise ALP-RD is recommended.
+struct AlpSamplerResult {
+  /// Recommended compression mode based on estimated compression ratios
+  AlpMode recommendation = AlpMode::kAlp;
+  /// Encoding preset for ALP decimal compression (always generated)
+  AlpEncodingPreset alp_preset;
+  /// Encoding preset for ALP-RD (generated if AlpRd would be better or requested)
+  std::optional<AlpRdEncodingPreset> alp_rd_preset;
+};
+
+// ----------------------------------------------------------------------
 // AlpSampler
 
 /// \class AlpSampler
-/// \brief Collects samples from data to be compressed with ALP
+/// \brief Collects samples from data to be compressed with ALP or ALP-RD
 ///
-/// Usage: Call AddSample() or AddSampleVector() multiple times to collect
-/// samples, then call Finalize() to retrieve the resulting preset.
+/// This class collects representative samples from the data and generates
+/// encoding presets for both ALP (decimal compression) and ALP-RD (real doubles).
+/// It also determines which compression mode is likely to achieve better
+/// compression ratios.
+///
+/// Usage:
+/// \code
+///   AlpSampler<double> sampler;
+///
+///   // Add samples (either as one large buffer or vector by vector)
+///   sampler.AddSample({data, num_elements});
+///   // Or:
+///   sampler.AddSampleVector({vector_data, vector_size});
+///
+///   // Finalize and get presets with recommendation
+///   AlpSamplerResult result = sampler.Finalize();
+///
+///   // Use the recommended mode
+///   if (result.recommendation == AlpMode::kAlp) {
+///     // Use result.alp_preset for ALP compression
+///   } else {
+///     // Use result.alp_rd_preset.value() for ALP-RD compression
+///   }
+/// \endcode
 ///
 /// \tparam T the floating point type (float or double) to sample
 template <typename T>
@@ -44,11 +89,6 @@ class AlpSampler {
  public:
   /// \brief Default constructor
   AlpSampler();
-
-  /// \brief Helper struct containing the preset for ALP compression
-  struct AlpSamplerResult {
-    AlpEncodingPreset alp_preset;
-  };
 
   /// \brief Add a sample of arbitrary size
   ///
@@ -64,12 +104,20 @@ class AlpSampler {
   ///            Size should be <= AlpConstants::kAlpVectorSize.
   void AddSampleVector(arrow::util::span<const T> input);
 
-  /// \brief Finalize sampling and generate the encoding preset
+  /// \brief Finalize sampling and generate encoding presets
   ///
-  /// \return an AlpSamplerResult containing the generated encoding preset
-  AlpSamplerResult Finalize();
+  /// Generates presets for both ALP and ALP-RD compression, compares their
+  /// estimated compression ratios, and returns a recommendation.
+  ///
+  /// \param[in] always_generate_alp_rd_preset If true, always generate the
+  ///            ALP-RD preset even if ALP is recommended. If false (default),
+  ///            ALP-RD preset is only generated if it would be recommended.
+  /// \return an AlpSamplerResult containing presets and recommendation
+  AlpSamplerResult Finalize(bool always_generate_alp_rd_preset = false);
 
  private:
+  using ExactType = typename AlpTypedConstants<T>::FloatingToExact;
+
   /// \brief Helper struct to encapsulate settings used for sampling
   struct AlpSamplingParameters {
     uint64_t num_lookup_value;
@@ -115,7 +163,7 @@ class AlpSampler {
   /// Number of vectors to sample per rowgroup
   const uint64_t sample_vectors_per_rowgroup_;
   /// Jump interval for rowgroup sampling
-  const uint64_t rowgroup_sample_jump_;
+  uint64_t rowgroup_sample_jump_;
 };
 
 }  // namespace alp
