@@ -251,6 +251,59 @@ class AlpTypedConstants<double> {
   using FloatingToSignedExact = int64_t;
 };
 
+// ----------------------------------------------------------------------
+// AlpRdConstants
+
+/// \brief Constants used throughout ALP-RD (Real Doubles) compression
+///
+/// ALP-RD is an alternative compression method for floating-point values that
+/// cannot be efficiently encoded as decimals. Unlike standard ALP which uses
+/// decimal encoding, ALP-RD:
+///   1. Splits each float/double's bit representation into left (high) and
+///      right (low) parts
+///   2. Dictionary-encodes the left parts (most values share common high bits)
+///   3. Bit-packs both left (dictionary indices) and right parts separately
+///   4. Stores exceptions for left parts not found in the dictionary
+///
+/// This approach works well for "real" floating-point data like sensor readings
+/// where values don't have clean decimal representations but often share
+/// common bit patterns in their high bits.
+class AlpRdConstants {
+ public:
+  /// Number of elements compressed together as a unit (same as ALP).
+  static constexpr uint32_t kAlpVectorSize = 1024;
+
+  /// Maximum length (bits) of left part when cutting a value into left/right.
+  /// The algorithm tries all positions from 1 to kCuttingLimit to find the
+  /// best split point that minimizes compressed size.
+  static constexpr uint8_t kCuttingLimit = 16;
+
+  /// Default maximum bit width for dictionary indices.
+  /// A value of 8 means the dictionary can have up to 2^8 = 256 entries.
+  /// This is a reasonable default that balances dictionary size vs compression.
+  static constexpr uint8_t kDefaultMaxDictionaryBitWidth = 8;
+
+  /// Type used to store dictionary entries (left parts of split values).
+  /// uint16_t is sufficient since left parts are at most 16 bits (kCuttingLimit).
+  using DictionaryElementType = uint16_t;
+
+  /// Type used to store exception values (left parts not in dictionary).
+  /// Same as DictionaryElementType since exceptions are also left parts.
+  using ExceptionType = uint16_t;
+
+  /// Type used to store exception positions within a compressed vector.
+  /// uint16_t is sufficient since vector size is at most 1024.
+  using PositionType = uint16_t;
+
+  /// \brief Get the maximum dictionary size for a given bit width
+  ///
+  /// \param[in] bit_width the number of bits used for dictionary indices
+  /// \return the maximum number of dictionary entries (2^bit_width)
+  static constexpr uint64_t GetMaxDictionarySize(uint8_t bit_width) {
+    return static_cast<uint64_t>(1) << bit_width;
+  }
+};
+
 }  // namespace alp
 }  // namespace util
 }  // namespace arrow
