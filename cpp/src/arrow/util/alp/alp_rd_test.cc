@@ -698,3 +698,4 @@ TEST(AlpRdSpecialValuesTest, NegativeZero) {
 }  // namespace util
 }  // namespace arrow
 
+

@@ -96,7 +96,8 @@ constexpr uint64_t Pow10(uint64_t exp) {
 // Encoding type enum (matching Snowflake's ComprEngine pattern)
 enum class EncodingType {
   kALP,
-  kByteStreamSplit,
+  kByteStreamSplit,      // BSS + ZSTD
+  kByteStreamSplitLZ4,   // BSS + LZ4
   kZSTD,
 };
 
@@ -141,6 +142,10 @@ struct RealComprBenchmarkData {
       case EncodingType::kByteStreamSplit:
         current_encoding = Encoding::BYTE_STREAM_SPLIT;
         codec = ::arrow::util::Codec::Create(::arrow::Compression::ZSTD).ValueOrDie();
+        break;
+      case EncodingType::kByteStreamSplitLZ4:
+        current_encoding = Encoding::BYTE_STREAM_SPLIT;
+        codec = ::arrow::util::Codec::Create(::arrow::Compression::LZ4_FRAME).ValueOrDie();
         break;
       case EncodingType::kZSTD:
         // ZSTD uses PLAIN encoding + compression
@@ -1091,9 +1096,10 @@ class DoubleBenchmark : public benchmark::Fixture {
   X(Value4, "value4")
 
 // Algorithm list for all benchmarks (matching Snowflake's pattern)
-#define ALGORITHM_LIST                  \
-  X(ALP, kALP)                          \
-  X(BYTESTREAMSPLIT, kByteStreamSplit)  \
+#define ALGORITHM_LIST                      \
+  X(ALP, kALP)                              \
+  X(BYTESTREAMSPLIT, kByteStreamSplit)      \
+  X(BYTESTREAMSPLITLZ4, kByteStreamSplitLZ4)\
   X(ZSTD, kZSTD)
 
 // ============================================================================
@@ -1640,6 +1646,8 @@ ALGORITHM_LIST
   GENERATE_ALGORITHM_FOR_POI(COLUMN_CAP, COLUMN_LOWER, ALP, kALP)              \
   GENERATE_ALGORITHM_FOR_POI(COLUMN_CAP, COLUMN_LOWER, BYTESTREAMSPLIT,        \
                              kByteStreamSplit)                                 \
+  GENERATE_ALGORITHM_FOR_POI(COLUMN_CAP, COLUMN_LOWER, BYTESTREAMSPLITLZ4,     \
+                             kByteStreamSplitLZ4)                              \
   GENERATE_ALGORITHM_FOR_POI(COLUMN_CAP, COLUMN_LOWER, ZSTD, kZSTD)
 
 #define X(COLUMN_CAP, COLUMN_LOWER) \
@@ -1672,6 +1680,8 @@ ALGORITHM_LIST
   GENERATE_ALGORITHM_FOR_COMMON_GOVERNMENT(COLUMN_CAP, COLUMN_LOWER, ALP, kALP)    \
   GENERATE_ALGORITHM_FOR_COMMON_GOVERNMENT(COLUMN_CAP, COLUMN_LOWER,               \
                                            BYTESTREAMSPLIT, kByteStreamSplit)      \
+  GENERATE_ALGORITHM_FOR_COMMON_GOVERNMENT(COLUMN_CAP, COLUMN_LOWER,               \
+                                           BYTESTREAMSPLITLZ4, kByteStreamSplitLZ4)\
   GENERATE_ALGORITHM_FOR_COMMON_GOVERNMENT(COLUMN_CAP, COLUMN_LOWER, ZSTD, kZSTD)
 
 #define X(COLUMN_CAP, COLUMN_LOWER) \
@@ -1691,6 +1701,8 @@ COMMON_GOVERNMENT_COLUMN_LIST
   GENERATE_ALGORITHM_FOR_ARADE(COLUMN_CAP, COLUMN_LOWER, ALP, kALP)             \
   GENERATE_ALGORITHM_FOR_ARADE(COLUMN_CAP, COLUMN_LOWER, BYTESTREAMSPLIT,       \
                                kByteStreamSplit)                                \
+  GENERATE_ALGORITHM_FOR_ARADE(COLUMN_CAP, COLUMN_LOWER, BYTESTREAMSPLITLZ4,    \
+                               kByteStreamSplitLZ4)                             \
   GENERATE_ALGORITHM_FOR_ARADE(COLUMN_CAP, COLUMN_LOWER, ZSTD, kZSTD)
 
 #define X(COLUMN_CAP, COLUMN_LOWER) \

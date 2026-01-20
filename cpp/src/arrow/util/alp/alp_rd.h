@@ -715,3 +715,4 @@ class AlpRdCompression : private AlpRdConstants {
 }  // namespace util
 }  // namespace arrow
 
+
