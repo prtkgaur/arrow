@@ -593,7 +593,10 @@ AlpEncodingPreset AlpCompression<T>::CreateEncodingPreset(
 
   std::map<AlpExponentAndFactor, uint64_t> best_k_combinations_hash;
 
-  uint64_t best_compressed_size_bits = std::numeric_limits<uint64_t>::max();
+  // Track total compressed size across all samples for averaging
+  uint64_t total_compressed_size_bits = 0;
+  uint64_t total_sample_count = 0;
+
   // For each vector sampled.
   for (const std::vector<T>& sampled_vector : vectors_sampled) {
     const uint64_t num_samples = sampled_vector.size();
@@ -623,12 +626,13 @@ AlpEncodingPreset AlpCompression<T>::CreateEncodingPreset(
                                                  *estimated_compression_size};
         if (CompareAlpCombinations(current_combination, best_combination)) {
           best_combination = current_combination;
-          best_compressed_size_bits =
-              std::min(best_compressed_size_bits, *estimated_compression_size);
         }
       }
     }
     best_k_combinations_hash[best_combination.exponent_and_factor]++;
+    // Accumulate the best compression size for this vector for averaging
+    total_compressed_size_bits += best_combination.estimated_compression_size;
+    total_sample_count += num_samples;
   }
 
   // Convert our hash to a Combination vector to be able to sort.
@@ -654,9 +658,13 @@ AlpEncodingPreset AlpCompression<T>::CreateEncodingPreset(
     combinations.push_back(best_k_combinations[i].exponent_and_factor);
   }
 
-  const uint64_t best_compressed_size_bytes =
-      std::ceil(best_compressed_size_bits / 8.0);
-  return {combinations, best_compressed_size_bytes};
+  // Use average compressed size across all samples (not minimum!)
+  // This gives a more representative estimate for datasets with high exception rates
+  const uint64_t avg_compressed_size_bytes =
+      total_sample_count > 0
+          ? static_cast<uint64_t>(std::ceil(total_compressed_size_bits / 8.0))
+          : 0;
+  return {combinations, avg_compressed_size_bytes};
 }
 
 template <typename T>
