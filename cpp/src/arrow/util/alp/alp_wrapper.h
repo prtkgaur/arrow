@@ -24,6 +24,7 @@
 
 #include "arrow/util/alp/alp.h"
 #include "arrow/util/alp/alp_rd.h"
+#include "arrow/util/alp/alp_sampler.h"
 
 namespace arrow {
 namespace util {
@@ -51,6 +52,19 @@ namespace alp {
 template <typename T>
 class AlpWrapper {
  public:
+  /// \brief Create a sampling preset from input data
+  ///
+  /// Samples the input data and generates encoding presets for both ALP and
+  /// ALP-RD compression, along with a recommendation for which mode to use.
+  /// This can be used to pre-compute the preset once and reuse it for multiple
+  /// encode calls via EncodeWithPreset().
+  ///
+  /// \param[in] decomp pointer to the input data to sample
+  /// \param[in] decomp_size size of decomp in bytes.
+  ///            This needs to be a multiple of sizeof(T).
+  /// \return AlpSamplerResult containing presets and recommended mode
+  static AlpSamplerResult CreateSamplingPreset(const T* decomp, size_t decomp_size);
+
   /// \brief Encode floating point values using ALP compression
   ///
   /// Samples the input data and selects the best compression mode (ALP or
@@ -71,6 +85,26 @@ class AlpWrapper {
   static void Encode(const T* decomp, size_t decomp_size, char* comp,
                      size_t* comp_size,
                      std::optional<AlpMode> enforce_mode = std::nullopt);
+
+  /// \brief Encode floating point values using a pre-computed sampling preset
+  ///
+  /// Uses the provided preset to encode data, avoiding the overhead of
+  /// re-sampling. This is useful when encoding multiple data blocks that
+  /// share similar characteristics (e.g., same column in multiple pages).
+  ///
+  /// \param[in] decomp pointer to the input that is to be encoded
+  /// \param[in] decomp_size size of decomp in bytes.
+  ///            This needs to be a multiple of sizeof(T).
+  /// \param[out] comp pointer to the memory region we will encode into.
+  ///             The caller is responsible for ensuring this is big enough.
+  /// \param[in,out] comp_size the actual size of the encoded data in bytes,
+  ///                expects the size of comp as input. If this is too small,
+  ///                this is set to 0 and we bail out.
+  /// \param[in] preset pre-computed AlpSamplerResult from CreateSamplingPreset()
+  ///            or a previous Encode call. Contains the recommended mode
+  ///            (ALP/ALP-RD) and the corresponding preset parameters.
+  static void EncodeWithPreset(const T* decomp, size_t decomp_size, char* comp,
+                               size_t* comp_size, const AlpSamplerResult& preset);
 
   /// \brief Decode floating point values
   ///

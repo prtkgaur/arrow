@@ -31,6 +31,7 @@
 #include <benchmark/benchmark.h>
 
 #include "arrow/buffer.h"
+#include "arrow/util/alp/alp_sampler.h"
 #include "arrow/util/alp/alp_wrapper.h"
 #include "arrow/util/compression.h"
 #include "parquet/encoding.h"
@@ -122,11 +123,18 @@ struct RealComprBenchmarkData {
   std::vector<T> output_uncompressed;
   uint64_t encoded_size = 0;
   Encoding::type current_encoding;
-  std::unique_ptr<::arrow::util::Codec> codec;  // For ZSTD
+  EncodingType encoding_type_;
+  std::unique_ptr<::arrow::util::Codec> codec;  // For ZSTD/LZ4
+
+  // Pre-computed ALP sampling preset (used to avoid sampling overhead in benchmark loop)
+  std::optional<::arrow::util::alp::AlpSamplerResult> alp_preset;
+  // Pre-allocated compression buffer for ALP (reused across iterations)
+  std::shared_ptr<::arrow::ResizableBuffer> alp_compression_buffer;
 
   virtual ~RealComprBenchmarkData() = default;
 
   void PrepareBenchmarkData(uint64_t element_count, EncodingType encoding_type) {
+    encoding_type_ = encoding_type;
     FillUncompressedInput(element_count);
 
     using DType =
@@ -156,11 +164,27 @@ struct RealComprBenchmarkData {
 
     // Do initial encoding to size buffers
     if (encoding_type == EncodingType::kALP) {
-      auto encoder = MakeTypedEncoder<DType>(Encoding::ALP, false, descr.get());
-      encoder->Put(input_uncompressed.data(),
-                   static_cast<int>(input_uncompressed.size()));
-      encoded_data = encoder->FlushValues();
-      encoded_size = encoded_data->size();
+      // Pre-compute the ALP sampling preset ONCE (this is the expensive part)
+      const size_t decomp_size = input_uncompressed.size() * sizeof(T);
+      alp_preset = ::arrow::util::alp::AlpWrapper<T>::CreateSamplingPreset(
+          input_uncompressed.data(), decomp_size);
+
+      // Pre-allocate the compression buffer
+      size_t max_comp_size =
+          ::arrow::util::alp::AlpWrapper<T>::GetMaxCompressedSize(decomp_size);
+      alp_compression_buffer =
+          ::arrow::AllocateResizableBuffer(max_comp_size).ValueOrDie();
+
+      // Do initial encoding using the preset
+      size_t comp_size = max_comp_size;
+      ::arrow::util::alp::AlpWrapper<T>::EncodeWithPreset(
+          input_uncompressed.data(), decomp_size,
+          reinterpret_cast<char*>(alp_compression_buffer->mutable_data()),
+          &comp_size, alp_preset.value());
+
+      (void)alp_compression_buffer->Resize(comp_size);  // Can't fail for shrinking
+      encoded_data = alp_compression_buffer;
+      encoded_size = comp_size;
     } else if (encoding_type == EncodingType::kZSTD) {
       // For ZSTD: Plain encode then compress
       auto encoder = MakeTypedEncoder<DType>(Encoding::PLAIN, false, descr.get());
@@ -188,7 +212,7 @@ struct RealComprBenchmarkData {
       encoder->Put(input_uncompressed.data(),
                    static_cast<int>(input_uncompressed.size()));
       auto byte_stream_split_data = encoder->FlushValues();
-      // Compress with ZSTD - use AllocateBuffer to properly manage memory
+      // Compress with ZSTD/LZ4 - use AllocateBuffer to properly manage memory
       int64_t max_compressed_len = codec->MaxCompressedLen(
           byte_stream_split_data->size(), byte_stream_split_data->data());
       auto compressed_buffer =
@@ -900,11 +924,24 @@ class DoubleBenchmark : public benchmark::Fixture {
     auto descr = MakeColumnDescriptor<DType>();
 
     if (encoding_type_ == EncodingType::kALP) {
-      auto encoder = MakeTypedEncoder<DType>(Encoding::ALP, false, descr.get());
-      encoder->Put(bd_->input_uncompressed.data(),
-                   static_cast<int>(bd_->input_uncompressed.size()));
-      bd_->encoded_data = encoder->FlushValues();
-      bd_->encoded_size = bd_->encoded_data->size();
+      // Use pre-computed preset to avoid sampling overhead
+      // The preset was computed in PrepareBenchmarkData()
+      const size_t decomp_size = bd_->input_uncompressed.size() * sizeof(T);
+      size_t comp_size =
+          ::arrow::util::alp::AlpWrapper<T>::GetMaxCompressedSize(decomp_size);
+
+      // Resize buffer if needed (usually already big enough from setup)
+      if (bd_->alp_compression_buffer->size() < static_cast<int64_t>(comp_size)) {
+        (void)bd_->alp_compression_buffer->Resize(comp_size);
+      }
+
+      ::arrow::util::alp::AlpWrapper<T>::EncodeWithPreset(
+          bd_->input_uncompressed.data(), decomp_size,
+          reinterpret_cast<char*>(bd_->alp_compression_buffer->mutable_data()),
+          &comp_size, bd_->alp_preset.value());
+
+      bd_->encoded_data = bd_->alp_compression_buffer;
+      bd_->encoded_size = comp_size;
     } else if (encoding_type_ == EncodingType::kZSTD) {
       // For ZSTD: Plain encode then compress
       auto encoder = MakeTypedEncoder<DType>(Encoding::PLAIN, false, descr.get());
@@ -956,13 +993,12 @@ class DoubleBenchmark : public benchmark::Fixture {
     auto descr = MakeColumnDescriptor<DType>();
 
     if (encoding_type_ == EncodingType::kALP) {
-      // For ALP: Use Parquet decoder
-      auto decoder = MakeTypedDecoder<DType>(Encoding::ALP, descr.get());
-      decoder->SetData(static_cast<int>(bd_->input_uncompressed.size()),
-                       bd_->encoded_data->data(),
-                       static_cast<int>(bd_->encoded_data->size()));
-      decoder->Decode(bd_->output_uncompressed.data(),
-                      static_cast<int>(bd_->output_uncompressed.size()));
+      // For ALP: Use AlpWrapper::Decode directly
+      ::arrow::util::alp::AlpWrapper<T>::Decode(
+          bd_->output_uncompressed.data(),
+          static_cast<uint32_t>(bd_->input_uncompressed.size()),
+          reinterpret_cast<const char*>(bd_->encoded_data->data()),
+          bd_->encoded_data->size());
     } else if (encoding_type_ == EncodingType::kZSTD) {
       // For ZSTD: Decompress then plain decode
       int64_t decompressed_len = bd_->input_uncompressed.size() * sizeof(T);

@@ -200,18 +200,41 @@ typename AlpWrapper<T>::AlpHeader AlpWrapper<T>::LoadHeader(const char* comp,
 }
 
 template <typename T>
+AlpSamplerResult AlpWrapper<T>::CreateSamplingPreset(const T* decomp,
+                                                      size_t decomp_size) {
+  ARROW_CHECK(decomp_size % sizeof(T) == 0) << "alp_encode_input_must_be_multiple_of_T";
+  const uint64_t element_count = decomp_size / sizeof(T);
+
+  AlpSampler<T> sampler;
+  sampler.AddSample({decomp, element_count});
+  return sampler.Finalize(/*always_generate_alp_rd_preset=*/true);
+}
+
+template <typename T>
 void AlpWrapper<T>::Encode(const T* decomp, size_t decomp_size, char* comp,
                            size_t* comp_size, std::optional<AlpMode> enforce_mode) {
+  // Create sampling preset
+  auto sampling_result = CreateSamplingPreset(decomp, decomp_size);
+
+  // Determine which mode to use (respecting enforce_mode if provided)
+  if (enforce_mode.has_value()) {
+    sampling_result.recommendation = enforce_mode.value();
+  }
+
+  // Delegate to EncodeWithPreset
+  EncodeWithPreset(decomp, decomp_size, comp, comp_size, sampling_result);
+}
+
+template <typename T>
+void AlpWrapper<T>::EncodeWithPreset(const T* decomp, size_t decomp_size, char* comp,
+                                     size_t* comp_size,
+                                     const AlpSamplerResult& preset) {
   ARROW_CHECK(decomp_size % sizeof(T) == 0) << "alp_encode_input_must_be_multiple_of_T";
   const uint64_t element_count = decomp_size / sizeof(T);
   const uint8_t version = AlpHeader::IsValidVersion(AlpConstants::kAlpVersion);
 
-  AlpSampler<T> sampler;
-  sampler.AddSample({decomp, element_count});
-  auto sampling_result = sampler.Finalize(/*always_generate_alp_rd_preset=*/true);
-
-  // Determine which mode to use
-  AlpMode mode = enforce_mode.value_or(sampling_result.recommendation);
+  // Use the recommended mode from the preset
+  AlpMode mode = preset.recommendation;
 
 
   // Make room to store header afterwards.
@@ -237,32 +260,32 @@ void AlpWrapper<T>::Encode(const T* decomp, size_t decomp_size, char* comp,
 
     compression_progress =
         EncodeAlp(decomp, element_count, comp_body, remaining_compressed_size,
-                  sampling_result.alp_preset);
+                  preset.alp_preset);
 
     *comp_size = fixed_header_size + compression_progress.num_compressed_bytes_produced;
   } else {
     // ALP-RD mode
-    ARROW_CHECK(sampling_result.alp_rd_preset.has_value())
+    ARROW_CHECK(preset.alp_rd_preset.has_value())
         << "alp_encode_alp_rd_preset_missing";
 
-    const AlpRdEncodingPreset& preset = sampling_result.alp_rd_preset.value();
+    const AlpRdEncodingPreset& rd_preset = preset.alp_rd_preset.value();
 
     // Write fixed header
     std::memcpy(encoded_header, &header, fixed_header_size);
 
     // Write dictionary (settings) after header
-    const uint64_t settings_size = preset.GetStoredSize();
+    const uint64_t settings_size = rd_preset.GetStoredSize();
     char* settings_ptr = comp + fixed_header_size;
     ARROW_CHECK(*comp_size >= fixed_header_size + settings_size)
         << "alp_encode_comp_too_small_for_settings";
-    preset.Store({settings_ptr, settings_size});
+    rd_preset.Store({settings_ptr, settings_size});
 
     char* comp_body = comp + fixed_header_size + settings_size;
     const uint64_t remaining_compressed_size =
         *comp_size - fixed_header_size - settings_size;
 
     compression_progress =
-        EncodeAlpRd(decomp, element_count, comp_body, remaining_compressed_size, preset);
+        EncodeAlpRd(decomp, element_count, comp_body, remaining_compressed_size, rd_preset);
 
     *comp_size = fixed_header_size + settings_size +
                  compression_progress.num_compressed_bytes_produced;
