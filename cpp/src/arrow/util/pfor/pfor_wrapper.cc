@@ -32,6 +32,7 @@
 #include "arrow/util/bit_util.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/span.h"
+#include "arrow/util/ubsan.h"
 
 namespace arrow {
 namespace util {
@@ -44,21 +45,43 @@ template <typename T>
 void PforWrapper<T>::StoreHeader(arrow::util::span<uint8_t> dest,
                                  const PforHeader& header) {
   uint8_t* ptr = dest.data();
-  ptr[0] = header.packing_mode;
-  ptr[1] = header.log_vector_size;
-  ptr[2] = header.value_byte_width;
-  std::memcpy(ptr + 3, &header.num_elements, sizeof(int32_t));
+  util::SafeStore(ptr + 0, header.packing_mode);
+  util::SafeStore(ptr + 1, header.log_vector_size);
+  util::SafeStore(ptr + 2, header.value_byte_width);
+  util::SafeStore(ptr + 3, header.num_elements);
 }
 
 template <typename T>
-typename PforWrapper<T>::PforHeader PforWrapper<T>::LoadHeader(
+Result<typename PforWrapper<T>::PforHeader> PforWrapper<T>::LoadHeader(
     arrow::util::span<const uint8_t> src) {
+  if (src.size() < static_cast<size_t>(PforConstants::kHeaderSize)) {
+    return Status::Invalid("PFOR compressed buffer too small for header: ",
+                           src.size(), " < ", PforConstants::kHeaderSize);
+  }
   PforHeader header;
   const uint8_t* ptr = src.data();
-  header.packing_mode = ptr[0];
-  header.log_vector_size = ptr[1];
-  header.value_byte_width = ptr[2];
-  std::memcpy(&header.num_elements, ptr + 3, sizeof(int32_t));
+  header.packing_mode = util::SafeLoadAs<uint8_t>(ptr + 0);
+  header.log_vector_size = util::SafeLoadAs<uint8_t>(ptr + 1);
+  header.value_byte_width = util::SafeLoadAs<uint8_t>(ptr + 2);
+  header.num_elements = util::SafeLoadAs<int32_t>(ptr + 3);
+
+  if (header.packing_mode != PforConstants::kPackingModeForBitPack) {
+    return Status::Invalid("PFOR unsupported packing mode: ",
+                           static_cast<int>(header.packing_mode));
+  }
+  if (header.value_byte_width != sizeof(T)) {
+    return Status::Invalid("PFOR value_byte_width mismatch: ",
+                           static_cast<int>(header.value_byte_width),
+                           " vs expected ", sizeof(T));
+  }
+  if (header.log_vector_size < PforConstants::kMinLogVectorSize ||
+      header.log_vector_size > PforConstants::kMaxLogVectorSize) {
+    return Status::Invalid("PFOR invalid log_vector_size: ",
+                           static_cast<int>(header.log_vector_size));
+  }
+  if (header.num_elements < 0) {
+    return Status::Invalid("PFOR invalid num_elements: ", header.num_elements);
+  }
   return header;
 }
 
@@ -101,7 +124,7 @@ void PforWrapper<T>::Encode(const T* values, int32_t num_values, int32_t vector_
   for (int32_t v = 0; v < num_vectors; ++v) {
     // Record offset (from start of offset array)
     uint32_t offset = static_cast<uint32_t>(write_ptr - data_start);
-    std::memcpy(offset_array_start + v * sizeof(uint32_t), &offset, sizeof(uint32_t));
+    util::SafeStore(offset_array_start + v * sizeof(uint32_t), offset);
 
     // Determine elements in this vector
     int32_t start_idx = v * vector_size;
@@ -140,24 +163,13 @@ Status PforWrapper<T>::Decode(T* values, int32_t num_values, const char* comp,
   if (comp == nullptr) {
     return Status::Invalid("PFOR compressed data pointer is null");
   }
-  if (comp_size < PforConstants::kHeaderSize) {
-    return Status::Invalid("PFOR compressed buffer too small for header: ", comp_size,
-                           " < ", PforConstants::kHeaderSize);
-  }
 
   const auto* src = reinterpret_cast<const uint8_t*>(comp);
 
   // Step 1: Read header
-  PforHeader header = LoadHeader(
-      arrow::util::span<const uint8_t>(src, PforConstants::kHeaderSize));
-
-  if (header.packing_mode != PforConstants::kPackingModeForBitPack) {
-    return Status::Invalid("PFOR unsupported packing mode: ", header.packing_mode);
-  }
-  if (header.value_byte_width != sizeof(T)) {
-    return Status::Invalid("PFOR value_byte_width mismatch: ", header.value_byte_width,
-                           " vs expected ", sizeof(T));
-  }
+  ARROW_ASSIGN_OR_RAISE(
+      PforHeader header,
+      LoadHeader(arrow::util::span<const uint8_t>(src, comp_size)));
 
   const int32_t vector_size = 1 << header.log_vector_size;
   const int32_t num_vectors =
@@ -168,9 +180,8 @@ Status PforWrapper<T>::Decode(T* values, int32_t num_values, const char* comp,
 
   // Step 3: Decode each vector
   for (int32_t v = 0; v < num_vectors; ++v) {
-    uint32_t offset;
-    std::memcpy(&offset, offset_array_start + v * sizeof(uint32_t),
-                sizeof(uint32_t));
+    uint32_t offset =
+        util::SafeLoadAs<uint32_t>(offset_array_start + v * sizeof(uint32_t));
 
     const uint8_t* vector_data = offset_array_start + offset;
 
