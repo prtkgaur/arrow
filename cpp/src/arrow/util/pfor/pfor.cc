@@ -119,13 +119,11 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
 
   // Step 4: Collect exceptions and replace with placeholder (0)
   PforEncodedVector<T> result;
-  result.info.frame_of_reference = min_val;
-  result.info.bit_width = bit_width;
-  result.info.num_exceptions = num_exceptions;
+  result.set_info(PforVectorInfo<T>(min_val, bit_width, num_exceptions));
 
   if (num_exceptions > 0) {
-    result.exception_positions.reserve(num_exceptions);
-    result.exception_values.reserve(num_exceptions);
+    result.mutable_exception_positions().reserve(num_exceptions);
+    result.mutable_exception_values().reserve(num_exceptions);
 
     UnsignedT mask = (bit_width >= PforTypeTraits<T>::kMaxBitWidth)
                          ? static_cast<UnsignedT>(-1)
@@ -133,8 +131,8 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
 
     for (int32_t i = 0; i < num_elements; ++i) {
       if (deltas[i] > mask) {
-        result.exception_positions.push_back(static_cast<int16_t>(i));
-        result.exception_values.push_back(values[i]);
+        result.mutable_exception_positions().push_back(static_cast<int16_t>(i));
+        result.mutable_exception_values().push_back(values[i]);
         deltas[i] = 0;
       }
     }
@@ -144,9 +142,9 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
   if (bit_width > 0) {
     int64_t packed_size =
         bit_util::BytesForBits(static_cast<int64_t>(num_elements) * bit_width);
-    result.packed_values.resize(static_cast<size_t>(packed_size), 0);
+    result.mutable_packed_values().resize(static_cast<size_t>(packed_size), 0);
 
-    bit_util::BitWriter writer(result.packed_values.data(),
+    bit_util::BitWriter writer(result.mutable_packed_values().data(),
                                static_cast<int>(packed_size));
     for (int32_t i = 0; i < num_elements; ++i) {
       writer.PutValue(static_cast<uint64_t>(deltas[i]), bit_width);
@@ -168,28 +166,21 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
   ARROW_ASSIGN_OR_RAISE(auto info, PforVectorInfo<T>::Load(data));
   const uint8_t* read_ptr = data.data() + PforVectorInfo<T>::kStoredSize;
 
-  if (info.bit_width > PforTypeTraits<T>::kMaxBitWidth) {
-    return Status::Invalid("PFOR bit_width out of range: ", info.bit_width);
-  }
-  if (info.num_exceptions < 0) {
-    return Status::Invalid("PFOR num_exceptions negative: ", info.num_exceptions);
-  }
-
   // Step 2: Handle constant data (bit_width == 0, no exceptions)
-  if (info.bit_width == 0 && info.num_exceptions == 0) {
-    std::fill(values, values + num_elements, info.frame_of_reference);
+  if (info.bit_width() == 0 && info.num_exceptions() == 0) {
+    std::fill(values, values + num_elements, info.frame_of_reference());
     return PforVectorInfo<T>::kStoredSize;
   }
 
   // Step 3: Unpack bit-packed deltas and add FOR
-  if (info.bit_width > 0) {
+  if (info.bit_width() > 0) {
     std::vector<UnsignedT> unsigned_values(num_elements);
-    const auto unsigned_for = static_cast<UnsignedT>(info.frame_of_reference);
+    const auto unsigned_for = static_cast<UnsignedT>(info.frame_of_reference());
 
     // Arrow's unpack handles arbitrary sizes: SIMD for complete batches,
     // then unpack_exact for the remainder.
     arrow::internal::unpack(read_ptr, unsigned_values.data(),
-                            static_cast<int>(num_elements), info.bit_width);
+                            static_cast<int>(num_elements), info.bit_width());
 
     // Add FOR and convert to signed output via SafeCopy
 #pragma GCC unroll PforConstants::kLoopUnrolls
@@ -200,30 +191,27 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
     }
 
     int64_t packed_size =
-        bit_util::BytesForBits(static_cast<int64_t>(num_elements) * info.bit_width);
+        bit_util::BytesForBits(static_cast<int64_t>(num_elements) * info.bit_width());
     read_ptr += packed_size;
   } else {
     // bit_width == 0 but has exceptions - fill with FOR
-    std::fill(values, values + num_elements, info.frame_of_reference);
+    std::fill(values, values + num_elements, info.frame_of_reference());
   }
 
   // Step 4: Patch exceptions (stored as original values)
-  if (info.num_exceptions > 0) {
+  const int16_t num_exceptions = info.num_exceptions();
+  if (num_exceptions > 0) {
     const uint8_t* positions_ptr = read_ptr;
-    read_ptr += info.num_exceptions * sizeof(int16_t);
+    read_ptr += num_exceptions * sizeof(int16_t);
 
     const uint8_t* values_ptr = read_ptr;
-    read_ptr += info.num_exceptions * sizeof(T);
+    read_ptr += num_exceptions * sizeof(T);
 
 #pragma GCC unroll PforConstants::kLoopUnrolls
 #pragma GCC ivdep
-    for (int16_t i = 0; i < info.num_exceptions; ++i) {
-      int16_t pos;
-      std::memcpy(&pos, positions_ptr + i * sizeof(int16_t), sizeof(int16_t));
-
-      T value;
-      std::memcpy(&value, values_ptr + i * sizeof(T), sizeof(T));
-
+    for (int16_t i = 0; i < num_exceptions; ++i) {
+      int16_t pos = util::SafeLoadAs<int16_t>(positions_ptr + i * sizeof(int16_t));
+      T value = util::SafeLoadAs<T>(values_ptr + i * sizeof(T));
       values[pos] = value;
     }
   }
@@ -243,37 +231,37 @@ Result<PforEncodedVectorView<T>> PforEncodedVectorView<T>::LoadView(
   ARROW_ASSIGN_OR_RAISE(auto info, PforVectorInfo<T>::Load(data));
 
   PforEncodedVectorView<T> view;
-  view.info = info;
-  view.num_elements = num_elements;
+  view.set_info(info);
+  view.set_num_elements(num_elements);
 
   const uint8_t* ptr = data.data() + PforVectorInfo<T>::kStoredSize;
 
   // packed_values: zero-copy span into the buffer
   int64_t packed_size = 0;
-  if (info.bit_width > 0) {
+  if (info.bit_width() > 0) {
     packed_size =
-        bit_util::BytesForBits(static_cast<int64_t>(num_elements) * info.bit_width);
-    view.packed_values = arrow::util::span<const uint8_t>(ptr, packed_size);
+        bit_util::BytesForBits(static_cast<int64_t>(num_elements) * info.bit_width());
+    view.set_packed_values(arrow::util::span<const uint8_t>(ptr, packed_size));
     ptr += packed_size;
   }
 
   // Exception positions and values: copy into aligned storage
-  if (info.num_exceptions > 0) {
-    view.exception_positions.resize(info.num_exceptions);
-    std::memcpy(view.exception_positions.data(), ptr,
-                info.num_exceptions * sizeof(int16_t));
-    ptr += info.num_exceptions * sizeof(int16_t);
+  if (info.num_exceptions() > 0) {
+    view.mutable_exception_positions().resize(info.num_exceptions());
+    std::memcpy(view.mutable_exception_positions().data(), ptr,
+                info.num_exceptions() * sizeof(int16_t));
+    ptr += info.num_exceptions() * sizeof(int16_t);
 
-    view.exception_values.resize(info.num_exceptions);
-    std::memcpy(view.exception_values.data(), ptr,
-                info.num_exceptions * sizeof(T));
+    view.mutable_exception_values().resize(info.num_exceptions());
+    std::memcpy(view.mutable_exception_values().data(), ptr,
+                info.num_exceptions() * sizeof(T));
   }
 
   return view;
 }
 
-template struct PforEncodedVectorView<int32_t>;
-template struct PforEncodedVectorView<int64_t>;
+template class PforEncodedVectorView<int32_t>;
+template class PforEncodedVectorView<int64_t>;
 
 // ----------------------------------------------------------------------
 // Serialization helpers
@@ -282,11 +270,12 @@ template <typename T>
 int64_t PforCompression<T>::SerializedVectorSize(const PforEncodedVector<T>& vec,
                                                   int32_t num_elements) {
   int64_t size = PforVectorInfo<T>::kStoredSize;
-  if (vec.info.bit_width > 0) {
-    size += bit_util::BytesForBits(static_cast<int64_t>(num_elements) * vec.info.bit_width);
+  if (vec.info().bit_width() > 0) {
+    size += bit_util::BytesForBits(
+        static_cast<int64_t>(num_elements) * vec.info().bit_width());
   }
-  size += vec.info.num_exceptions * static_cast<int64_t>(sizeof(int16_t));
-  size += vec.info.num_exceptions * static_cast<int64_t>(sizeof(T));
+  size += vec.info().num_exceptions() * static_cast<int64_t>(sizeof(int16_t));
+  size += vec.info().num_exceptions() * static_cast<int64_t>(sizeof(T));
   return size;
 }
 
@@ -297,25 +286,25 @@ int64_t PforCompression<T>::SerializeVector(const PforEncodedVector<T>& vec,
   uint8_t* write_ptr = dest.data();
 
   // Write vector info
-  vec.info.Store(arrow::util::span<uint8_t>(write_ptr, PforVectorInfo<T>::kStoredSize));
+  vec.info().Store(arrow::util::span<uint8_t>(write_ptr, PforVectorInfo<T>::kStoredSize));
   write_ptr += PforVectorInfo<T>::kStoredSize;
 
   // Write packed values
-  if (vec.info.bit_width > 0 && !vec.packed_values.empty()) {
-    std::memcpy(write_ptr, vec.packed_values.data(), vec.packed_values.size());
-    write_ptr += vec.packed_values.size();
+  if (vec.info().bit_width() > 0 && !vec.packed_values().empty()) {
+    std::memcpy(write_ptr, vec.packed_values().data(), vec.packed_values().size());
+    write_ptr += vec.packed_values().size();
   }
 
   // Write exception positions
-  if (vec.info.num_exceptions > 0) {
-    std::memcpy(write_ptr, vec.exception_positions.data(),
-                vec.info.num_exceptions * sizeof(int16_t));
-    write_ptr += vec.info.num_exceptions * sizeof(int16_t);
+  if (vec.info().num_exceptions() > 0) {
+    std::memcpy(write_ptr, vec.exception_positions().data(),
+                vec.info().num_exceptions() * sizeof(int16_t));
+    write_ptr += vec.info().num_exceptions() * sizeof(int16_t);
 
     // Write exception values (original integers)
-    std::memcpy(write_ptr, vec.exception_values.data(),
-                vec.info.num_exceptions * sizeof(T));
-    write_ptr += vec.info.num_exceptions * sizeof(T);
+    std::memcpy(write_ptr, vec.exception_values().data(),
+                vec.info().num_exceptions() * sizeof(T));
+    write_ptr += vec.info().num_exceptions() * sizeof(T);
   }
 
   return static_cast<int64_t>(write_ptr - dest.data());
