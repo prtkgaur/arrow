@@ -194,6 +194,9 @@ takes precedence over ccache if a storage backend is configured" ON)
 
   define_option(ARROW_GGDB_DEBUG "Pass -ggdb flag to debug builds" ON)
 
+  define_option(ARROW_RELEASE_O3
+                "Keep CMake's default -O3 in Release builds instead of -O2" OFF)
+
   define_option(ARROW_WITH_MUSL "Whether the system libc is musl or not" OFF)
 
   define_option(ARROW_ENABLE_THREADING "Enable threading in Arrow core" ON)
