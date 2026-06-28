@@ -632,20 +632,25 @@ endif()
 #   Same as Release, except with debug symbols enabled.
 
 if(NOT MSVC)
+  # CMake's default Release flags are "-O3 -DNDEBUG"; the appends below
+  # downgrade them to -O2, since the last -O flag wins in GCC. Set
+  # ARROW_RELEASE_O3 to skip the downgrade: the bit-packing kernels are
+  # built around the inlining and unrolling -O3 enables, and the
+  # throughput figures quoted for them were measured with it in effect.
   set(C_RELEASE_FLAGS "")
-  if(CMAKE_C_FLAGS_RELEASE MATCHES "-O3")
+  if(CMAKE_C_FLAGS_RELEASE MATCHES "-O3" AND NOT ARROW_RELEASE_O3)
     string(APPEND C_RELEASE_FLAGS " -O2")
   endif()
   set(CXX_RELEASE_FLAGS "")
-  if(CMAKE_CXX_FLAGS_RELEASE MATCHES "-O3")
+  if(CMAKE_CXX_FLAGS_RELEASE MATCHES "-O3" AND NOT ARROW_RELEASE_O3)
     string(APPEND CXX_RELEASE_FLAGS " -O2")
   endif()
   set(C_RELWITHDEBINFO_FLAGS "")
-  if(CMAKE_C_FLAGS_RELWITHDEBINFO MATCHES "-O3")
+  if(CMAKE_C_FLAGS_RELWITHDEBINFO MATCHES "-O3" AND NOT ARROW_RELEASE_O3)
     string(APPEND C_RELWITHDEBINFO_FLAGS " -O2")
   endif()
   set(CXX_RELWITHDEBINFO_FLAGS "")
-  if(CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-O3")
+  if(CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-O3" AND NOT ARROW_RELEASE_O3)
     string(APPEND CXX_RELWITHDEBINFO_FLAGS " -O2")
   endif()
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
