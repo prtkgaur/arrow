@@ -57,6 +57,42 @@ class PforConstants {
   static constexpr int64_t kLoopUnrolls = 4;
 };
 
+/// \brief Per-vector packing mode for PforCompression::EncodeVector.
+///
+/// Stored in the high bit of PforVectorInfo::bit_width (bit 7). BitPack = 0
+/// preserves the prior on-disk layout so existing buffers continue to
+/// round-trip; new values are added with higher numeric codes.
+enum class PackingMode : uint8_t {
+  /// Sequential little-endian bit-packed stream — the original PFOR layout.
+  /// Decoded with arrow::internal::unpack.
+  BitPack = 0,
+
+  /// FastLanes lane-interleaved 1024-bit format (Afroozeh & Boncz, VLDB '23).
+  /// Auto-vectorizable kernel; only valid when num_elements equals the
+  /// FastLanes block size (1024). Falls back to BitPack for shorter vectors.
+  FastLanes = 1,
+};
+
+/// \brief Output value order requested by the decoder.
+///
+/// Affects only FastLanes-encoded vectors (BitPack always returns flat).
+/// Selecting `Transposed` skips the per-vector FL_ORDER gather and is the
+/// only way to take full advantage of the FastLanes layout: the gather is
+/// scalar and dominates end-to-end decode cost. Downstream operators must
+/// be permutation-aware (work on values in stream order, i.e. apply
+/// fromTransposed32(t) when they need the original index).
+enum class OutputOrder : uint8_t {
+  /// Default. Decoded values appear in their original input order:
+  /// output[i] == input[i] for every i, for both PackingMode variants.
+  Flat = 0,
+
+  /// FastLanes transposed (stream) order. For FastLanes-encoded vectors,
+  /// output[t] == input[fromTransposed32(t)] (per 1024-block, no scatter
+  /// on decode). For BitPack-encoded vectors there is no permutation, so
+  /// they still produce flat output.
+  Transposed = 1,
+};
+
 /// \brief Type traits for PFOR integer types
 template <typename T>
 struct PforTypeTraits {};
