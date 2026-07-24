@@ -297,20 +297,43 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
         }
       }
     } else {
-      std::vector<UnsignedT> unsigned_values(num_elements);
+      // Unpack into a scratch buffer that does NOT alias `values`, then add
+      // FOR. Unpacking in place (aliasing the output as the unsigned scratch)
+      // stops the compiler from vectorizing the FOR-add loop — it can't prove
+      // values[] and (UnsignedT*)values[] don't overlap, even with ivdep — and
+      // the loop collapses to scalar (measured ~100x slower). Keep them
+      // separate; use the stack for the common (<=vector-size) case so there
+      // is still no per-vector heap allocation.
+      constexpr int32_t kStackScratch =
+          static_cast<int32_t>(PforConstants::kPforVectorSize);
+      UnsignedT stack_scratch[kStackScratch];
+      std::vector<UnsignedT> heap_scratch;
+      UnsignedT* scratch = stack_scratch;
+      if (num_elements > kStackScratch) {
+        heap_scratch.resize(num_elements);
+        scratch = heap_scratch.data();
+      }
       // Arrow's unpack handles arbitrary sizes: SIMD for complete batches,
       // then unpack_exact for the remainder.
       arrow::internal::unpack(
-          read_ptr, unsigned_values.data(),
+          read_ptr, scratch,
           arrow::internal::UnpackOptions{static_cast<int>(num_elements),
                                          info.bit_width()});
 
-      // Add FOR and convert to signed output via SafeCopy
-#pragma GCC unroll PforConstants::kLoopUnrolls
-#pragma GCC ivdep
+      // Add the frame-of-reference back and reinterpret unsigned->signed.
+      // This loop MUST vectorize or it dominates decode (perf showed the bias
+      // add, not the unpack, taking ~65% at ~4 GB/s). Two things are needed:
+      //   1. static_cast, NOT util::SafeCopy: SafeCopy builds an AlignedStorage
+      //      + memcpy + destroy per element, which the vectorizer won't touch.
+      //      The unsigned->signed cast is well-defined (C++20, modular) and
+      //      gives the identical bit pattern, so it is a drop-in replacement.
+      //   2. __restrict__: scratch's address escaped to unpack() above, so
+      //      restate that scratch and values don't alias.
+      // With both, the loop vectorizes and decode runs ~4x faster (~4 -> ~17 GB/s).
+      const UnsignedT* __restrict__ in = scratch;
+      T* __restrict__ out = values;
       for (int32_t i = 0; i < num_elements; ++i) {
-        unsigned_values[i] += unsigned_for;
-        values[i] = util::SafeCopy<T>(unsigned_values[i]);
+        out[i] = static_cast<T>(in[i] + unsigned_for);
       }
     }
 
