@@ -24,7 +24,8 @@
 // Build (from the Arrow repo root), one line:
 //   g++ -std=c++17 -O3 -march=native -Icpp/src -Icpp/thirdparty/fsst
 //   cpp/thirdparty/fsst/libfsst.cpp cpp/thirdparty/fsst/fsst_avx512.cpp
-//   cpp/src/parquet/onpair/onpair.cc cpp/src/parquet/onpair/fsst_onpair_benchmark.cc
+//   cpp/src/parquet/onpair/onpair.cc cpp/src/parquet/onpair/prefix_plus.cc
+//   cpp/src/parquet/onpair/fsst_onpair_benchmark.cc
 //   /usr/lib64/libzstd.so.1 /usr/lib64/liblz4.so.1 -o /tmp/fsst_onpair_bench
 //
 // Run:  taskset -c 0 /tmp/fsst_onpair_bench <corpora_dir>
@@ -44,6 +45,7 @@
 
 #include "fsst.h"
 #include "parquet/onpair/onpair.h"
+#include "parquet/onpair/prefix_plus.h"
 
 // zstd: declare the small, ABI-stable subset we use so the standalone build
 // needs only the installed libzstd (no dev header). Link libzstd.so directly.
@@ -624,6 +626,422 @@ Measured RunOnPairDedup(const Corpus& c, uint8_t bits, double threshold) {
   return m;
 }
 
+// FSST+ / OnPair+ (common-prefix extraction, DICT mode)
+//
+// Y. L. Alexandre, "FSST+: Enhancing String Compression Through Common Prefix
+// Extraction," MSc thesis, CWI, 2025. We evaluate the thesis's "DICT FSST+"
+// path (the one it recommends for columnar integration, sec 5.3.5): the column
+// is dictionary-encoded (distinct values + bit-packed row references), the
+// distinct set is sorted, and prefix extraction is applied to that sorted
+// dictionary. Sorting the dictionary is free of row-order concerns because the
+// references carry the mapping - which is exactly why the thesis notes the
+// within-block-sort limitation "does not apply" to DICT FSST+.
+//
+// The DP cleaving (prefix_plus::CleaveSorted, thesis sec 5.2.2) is shared. FSST+
+// cleaves the FSST-compressed distinct values (prefix/suffix are spans of the
+// compressed stream; the escape-255 guard keeps a symbol whole). OnPair+ cleaves
+// raw bytes and OnPair-compresses the {shared prefixes + per-value suffixes} as
+// one column - a deviation forced by OnPair emitting codes, not a splittable
+// byte stream. Both count a bit-packed row-reference (index) column, matching
+// OnPair16-dedup, so ratios are directly comparable.
+
+// Shared distinct-value builder (first-seen order) + per-row references. Same
+// open-addressing table as RunOnPairDedup's local build_dedup.
+struct Dedup {
+  std::vector<uint8_t> bytes;
+  std::vector<uint32_t> offsets;  // n_distinct + 1
+  std::vector<uint32_t> refs;     // n_rows -> distinct id
+  size_t n_distinct = 0;
+};
+
+Dedup BuildDedup(const Corpus& c) {
+  size_t n = c.n_rows();
+  Dedup d;
+  d.offsets.push_back(0);
+  d.refs.resize(n);
+  size_t cap = 1;
+  while (cap < n * 2) cap <<= 1;
+  const uint32_t kEmpty = 0xFFFFFFFFu;
+  std::vector<uint32_t> table(cap, kEmpty);
+  uint64_t mask = cap - 1;
+  uint32_t n_distinct = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* row = c.bytes.data() + c.offsets[i];
+    size_t len = c.offsets[i + 1] - c.offsets[i];
+    uint64_t slot = HashBytes(row, len) & mask;
+    uint32_t id;
+    for (;;) {
+      uint32_t cur = table[slot];
+      if (cur == kEmpty) {
+        id = n_distinct++;
+        table[slot] = id;
+        d.bytes.insert(d.bytes.end(), row, row + len);
+        d.offsets.push_back(static_cast<uint32_t>(d.bytes.size()));
+        break;
+      }
+      size_t off = d.offsets[cur];
+      size_t clen = d.offsets[cur + 1] - off;
+      if (clen == len && std::memcmp(d.bytes.data() + off, row, len) == 0) { id = cur; break; }
+      slot = (slot + 1) & mask;
+    }
+    d.refs[i] = id;
+  }
+  d.n_distinct = n_distinct;
+  return d;
+}
+
+namespace pp = parquet::prefix_plus;
+
+// ---- FSST+ ----------------------------------------------------------------
+
+struct FsstPlusEnc {
+  std::vector<uint8_t> comp;        // FSST-compressed distinct values (spans by id)
+  std::vector<uint32_t> comp_off;   // distinct id -> byte offset into comp
+  std::vector<uint32_t> comp_len;   // distinct id -> compressed length
+  std::vector<uint8_t> table;       // fsst_export symbol table
+  size_t table_bytes = 0;
+  fsst_decoder_t dec{};
+  std::vector<uint32_t> order;      // sorted rank -> distinct id (by compressed bytes)
+  std::vector<uint32_t> sorted_pos; // distinct id -> sorted rank
+  pp::Cleaving cl;                  // over the sorted compressed spans
+  size_t nd = 0;
+};
+
+FsstPlusEnc EncodeFsstPlus(const Corpus& c, const Dedup& dd) {
+  FsstPlusEnc e;
+  size_t nd = dd.n_distinct;
+  e.nd = nd;
+
+  std::vector<size_t> lenIn(nd);
+  std::vector<const unsigned char*> strIn(nd);
+  for (size_t i = 0; i < nd; ++i) {
+    lenIn[i] = dd.offsets[i + 1] - dd.offsets[i];
+    strIn[i] = dd.bytes.data() + dd.offsets[i];
+  }
+  fsst_encoder_t* enc = fsst_create(nd, lenIn.data(), strIn.data(), 0);
+  size_t out_cap = 7 * nd + 2 * dd.bytes.size() + 16;
+  e.comp.assign(out_cap, 0);
+  std::vector<size_t> lenOut(nd);
+  std::vector<unsigned char*> strOut(nd);
+  size_t done = fsst_compress(enc, nd, lenIn.data(), strIn.data(), out_cap, e.comp.data(),
+                              lenOut.data(), strOut.data());
+  if (done != nd) {
+    std::fprintf(stderr, "FSST+ compressed %zu/%zu distinct on %s\n", done, nd, c.name.c_str());
+    std::abort();
+  }
+  e.comp_off.resize(nd);
+  e.comp_len.resize(nd);
+  for (size_t i = 0; i < nd; ++i) {
+    e.comp_off[i] = static_cast<uint32_t>(strOut[i] - e.comp.data());
+    e.comp_len[i] = static_cast<uint32_t>(lenOut[i]);
+  }
+  unsigned char tbl[FSST_MAXHEADER];
+  e.table_bytes = fsst_export(enc, tbl);
+  e.table.assign(tbl, tbl + e.table_bytes);
+  e.dec = fsst_decoder(enc);
+  fsst_destroy(enc);
+
+  // Sort distinct ids by their compressed bytes so shared compressed prefixes
+  // are adjacent (FSST maps equal inputs to equal compressed forms).
+  e.order.resize(nd);
+  for (size_t i = 0; i < nd; ++i) e.order[i] = static_cast<uint32_t>(i);
+  const uint8_t* base = e.comp.data();
+  std::sort(e.order.begin(), e.order.end(), [&](uint32_t a, uint32_t b) {
+    size_t la = e.comp_len[a], lb = e.comp_len[b];
+    int cmp = std::memcmp(base + e.comp_off[a], base + e.comp_off[b], std::min(la, lb));
+    if (cmp != 0) return cmp < 0;
+    return la < lb;
+  });
+  e.sorted_pos.resize(nd);
+  for (size_t k = 0; k < nd; ++k) e.sorted_pos[e.order[k]] = static_cast<uint32_t>(k);
+
+  std::vector<const uint8_t*> sptr(nd);
+  std::vector<size_t> slen(nd);
+  for (size_t k = 0; k < nd; ++k) {
+    sptr[k] = base + e.comp_off[e.order[k]];
+    slen[k] = e.comp_len[e.order[k]];
+  }
+  e.cl = pp::CleaveSorted(sptr.data(), slen.data(), nd, pp::kMaxPrefix, /*guard_escape255=*/true);
+  return e;
+}
+
+// Exact FSST+ stored size (thesis sec 3.1 layout) + bit-packed row references.
+size_t FsstPlusSize(const FsstPlusEnc& e, const Corpus& c) {
+  size_t nd = e.nd;
+  size_t num_blocks = (nd + pp::kBlockSize - 1) / pp::kBlockSize;
+  size_t bytes = 2 + 4 * num_blocks + 4;  // num_blocks + block_start_offsets[] + data_end_offset
+  for (size_t bstart = 0; bstart < nd; bstart += pp::kBlockSize) {
+    size_t bn = std::min(pp::kBlockSize, nd - bstart);
+    bytes += 1 + 2 * bn;  // num_strings + suffix_data_area_offsets[]
+    for (size_t k = bstart; k < bstart + bn; ++k) {
+      uint32_t p = e.cl.prefix_len[k];
+      uint32_t clen = e.comp_len[e.order[k]];
+      bytes += 1;                                     // prefix_length
+      if (p > 0) bytes += 2;                          // jump_back_offset
+      bytes += clen - p;                              // compressed suffix
+      if (p > 0 && e.cl.chunk_first[k] == k) bytes += p;  // shared prefix, stored once
+    }
+  }
+  bytes += e.table_bytes;
+  return bytes + BitPackedBytes(c.n_rows(), IndexBits(nd));
+}
+
+Measured RunFsstPlus(const Corpus& c) {
+  size_t n = c.n_rows();
+  Dedup dd = BuildDedup(c);
+  FsstPlusEnc e = EncodeFsstPlus(c, dd);
+  Measured m;
+  m.label = "FSST+";
+  m.compressed_bytes = FsstPlusSize(e, c);
+
+  std::vector<double> enc;
+  for (int it = 0; it < kEncodeIters; ++it) {
+    auto t0 = Clock::now();
+    Dedup d2 = BuildDedup(c);
+    FsstPlusEnc e2 = EncodeFsstPlus(c, d2);
+    double dt = std::chrono::duration<double>(Clock::now() - t0).count();
+    asm volatile("" ::"r"(e2.nd) : "memory");
+    enc.push_back(Mib(c.raw_bytes()) / dt);
+  }
+  m.encode_mibs = Median(std::move(enc));
+
+  // Decode: reconstruct each sorted distinct value from its stored (prefix once
+  // + own suffix) compressed form and FSST-decode it, then gather rows by ref.
+  size_t distinct_total = dd.bytes.size();
+  size_t cap = c.raw_bytes() + 16;
+  const uint8_t* base = e.comp.data();
+  auto decode = [&](std::vector<uint8_t>& dictbuf, std::vector<uint32_t>& voff,
+                    uint8_t* out) -> size_t {
+    voff.assign(e.nd + 1, 0);
+    std::vector<uint8_t> tmp;
+    tmp.reserve(pp::kMaxPrefix + 256);
+    size_t w = 0;
+    for (size_t k = 0; k < e.nd; ++k) {
+      uint32_t p = e.cl.prefix_len[k];
+      uint32_t rep = e.cl.chunk_first[k];
+      uint32_t clen = e.comp_len[e.order[k]];
+      const uint8_t* cbytes = base + e.comp_off[e.order[k]];
+      tmp.clear();
+      if (p > 0) {
+        const uint8_t* rbytes = base + e.comp_off[e.order[rep]];
+        tmp.insert(tmp.end(), rbytes, rbytes + p);
+      }
+      tmp.insert(tmp.end(), cbytes + p, cbytes + clen);
+      size_t dl = fsst_decompress(&e.dec, tmp.size(), tmp.data(), dictbuf.size() - w,
+                                  dictbuf.data() + w);
+      w += dl;
+      voff[k + 1] = static_cast<uint32_t>(w);
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < n; ++i) {
+      uint32_t k = e.sorted_pos[dd.refs[i]];
+      size_t off = voff[k], len = voff[k + 1] - off;
+      std::memcpy(out + o, dictbuf.data() + off, len);
+      o += len;
+    }
+    return o;
+  };
+
+  {
+    std::vector<uint8_t> dictbuf(distinct_total + 32, 0), out(cap);
+    std::vector<uint32_t> voff;
+    size_t w = decode(dictbuf, voff, out.data());
+    if (w != c.raw_bytes() || std::memcmp(out.data(), c.bytes.data(), c.raw_bytes()) != 0) {
+      std::fprintf(stderr, "FSST+ roundtrip mismatch on %s (w=%zu raw=%zu)\n", c.name.c_str(), w,
+                   c.raw_bytes());
+      std::abort();
+    }
+  }
+  std::vector<double> dec_r;
+  for (int it = 0; it < kDecodeIters; ++it) {
+    std::vector<uint8_t> dictbuf(distinct_total + 32, 0), out(cap);
+    std::vector<uint32_t> voff;
+    auto t0 = Clock::now();
+    size_t w = decode(dictbuf, voff, out.data());
+    double dt = std::chrono::duration<double>(Clock::now() - t0).count();
+    asm volatile("" ::"r"(w) : "memory");
+    dec_r.push_back(Mib(c.raw_bytes()) / dt);
+  }
+  m.decode_mibs = Median(std::move(dec_r));
+  return m;
+}
+
+// ---- OnPair+ --------------------------------------------------------------
+
+struct OnPairPlusEnc {
+  op::Column col;                          // {shared prefixes + suffixes} as one column
+  std::vector<uint32_t> piece_off;         // num_pieces + 1 byte offsets (also decoded boundaries)
+  size_t num_pieces = 0;
+  std::vector<uint32_t> order, sorted_pos;  // distinct id <-> sorted rank (by raw bytes)
+  pp::Cleaving cl;                         // over raw sorted values
+  std::vector<uint32_t> prefix_piece;      // sorted rank of a chunk rep -> its prefix piece index
+  size_t n_prefix_pieces = 0;              // suffix piece of sorted value k == n_prefix_pieces + k
+  size_t nd = 0;
+};
+
+OnPairPlusEnc EncodeOnPairPlus(const Corpus& c, const Dedup& dd, double threshold) {
+  (void)c;
+  OnPairPlusEnc e;
+  size_t nd = dd.n_distinct;
+  e.nd = nd;
+
+  const uint8_t* base = dd.bytes.data();
+  e.order.resize(nd);
+  for (size_t i = 0; i < nd; ++i) e.order[i] = static_cast<uint32_t>(i);
+  std::sort(e.order.begin(), e.order.end(), [&](uint32_t a, uint32_t b) {
+    size_t la = dd.offsets[a + 1] - dd.offsets[a], lb = dd.offsets[b + 1] - dd.offsets[b];
+    int cmp = std::memcmp(base + dd.offsets[a], base + dd.offsets[b], std::min(la, lb));
+    if (cmp != 0) return cmp < 0;
+    return la < lb;
+  });
+  e.sorted_pos.resize(nd);
+  for (size_t k = 0; k < nd; ++k) e.sorted_pos[e.order[k]] = static_cast<uint32_t>(k);
+
+  std::vector<const uint8_t*> sptr(nd);
+  std::vector<size_t> slen(nd);
+  for (size_t k = 0; k < nd; ++k) {
+    uint32_t id = e.order[k];
+    sptr[k] = base + dd.offsets[id];
+    slen[k] = dd.offsets[id + 1] - dd.offsets[id];
+  }
+  e.cl = pp::CleaveSorted(sptr.data(), slen.data(), nd, pp::kMaxPrefix, /*guard_escape255=*/false);
+
+  // Pieces: each chunk's shared prefix once, then every value's suffix.
+  std::vector<uint8_t> pbytes;
+  std::vector<uint32_t> poff;
+  poff.push_back(0);
+  e.prefix_piece.assign(nd, 0xFFFFFFFFu);
+  uint32_t pc = 0;
+  for (size_t k = 0; k < nd; ++k) {
+    if (e.cl.prefix_len[k] > 0 && e.cl.chunk_first[k] == k) {
+      e.prefix_piece[k] = pc++;
+      pbytes.insert(pbytes.end(), sptr[k], sptr[k] + e.cl.prefix_len[k]);
+      poff.push_back(static_cast<uint32_t>(pbytes.size()));
+    }
+  }
+  e.n_prefix_pieces = pc;
+  for (size_t k = 0; k < nd; ++k) {
+    uint32_t p = e.cl.prefix_len[k];
+    pbytes.insert(pbytes.end(), sptr[k] + p, sptr[k] + slen[k]);
+    poff.push_back(static_cast<uint32_t>(pbytes.size()));
+  }
+  e.num_pieces = poff.size() - 1;
+  e.piece_off = std::move(poff);
+
+  op::Config cfg{16, threshold, 42};
+  e.col = op::Compress(pbytes.data(), pbytes.size(), e.piece_off.data(), e.num_pieces, cfg);
+  return e;
+}
+
+// OnPair+ stored size: the shared OnPair model (dict + bit-packed offsets +
+// codes for prefixes-once + suffixes), a bit-packed piece-boundary array (in
+// place of FSST+'s compressed byte spans), the same per-value prefix_length /
+// jump-back overhead and block headers as FSST+, and the row-reference column.
+size_t OnPairPlusSize(const OnPairPlusEnc& e, const Corpus& c) {
+  const op::Column& col = e.col;
+  size_t dict_bytes = col.dict.logical_bytes();
+  size_t code_bits = IndexBits(col.dict.num_tokens());
+  size_t codes = BitPackedBytes(col.codes.size(), code_bits);
+  size_t dict_offsets =
+      BitPackedBytes(col.dict.offsets.size(), std::max<size_t>(1, BitWidth(dict_bytes)));
+  size_t piece_bound =
+      BitPackedBytes(e.num_pieces, std::max<size_t>(1, BitWidth(col.codes.size())));
+  size_t nd = e.nd;
+  size_t num_blocks = (nd + pp::kBlockSize - 1) / pp::kBlockSize;
+  size_t structural = 2 + 4 * num_blocks + 4;
+  for (size_t bstart = 0; bstart < nd; bstart += pp::kBlockSize) {
+    size_t bn = std::min(pp::kBlockSize, nd - bstart);
+    structural += 1;  // num_strings
+    for (size_t k = bstart; k < bstart + bn; ++k)
+      structural += 1 + (e.cl.prefix_len[k] > 0 ? 2 : 0);
+  }
+  size_t refs = BitPackedBytes(c.n_rows(), IndexBits(nd));
+  return dict_bytes + dict_offsets + codes + piece_bound + structural + refs;
+}
+
+Measured RunOnPairPlus(const Corpus& c, double threshold) {
+  size_t n = c.n_rows();
+  Dedup dd = BuildDedup(c);
+  OnPairPlusEnc e = EncodeOnPairPlus(c, dd, threshold);
+  Measured m;
+  m.label = "OnPair+";
+  m.compressed_bytes = OnPairPlusSize(e, c);
+
+  std::vector<double> enc;
+  for (int it = 0; it < kEncodeIters; ++it) {
+    auto t0 = Clock::now();
+    Dedup d2 = BuildDedup(c);
+    OnPairPlusEnc e2 = EncodeOnPairPlus(c, d2, threshold);
+    double dt = std::chrono::duration<double>(Clock::now() - t0).count();
+    asm volatile("" ::"r"(e2.num_pieces) : "memory");
+    enc.push_back(Mib(c.raw_bytes()) / dt);
+  }
+  m.encode_mibs = Median(std::move(enc));
+
+  // Decode: OnPair-materialize all pieces (unpacking the code stream), then for
+  // each sorted value concatenate its prefix piece + suffix piece, and gather
+  // rows by reference.
+  size_t piece_total = op::DecodedLen(e.col);
+  size_t distinct_total = dd.bytes.size();
+  size_t cap = c.raw_bytes() + 16;
+  size_t code_bits = IndexBits(e.col.dict.num_tokens());
+  std::vector<uint32_t> cw(e.col.codes.begin(), e.col.codes.end());
+  std::vector<uint8_t> packed = op::PackValues(cw.data(), cw.size(), code_bits);
+
+  auto decode = [&](std::vector<uint8_t>& piecebuf, std::vector<uint8_t>& dictbuf,
+                    std::vector<uint32_t>& voff, uint8_t* out) -> size_t {
+    op::DecompressPacked(e.col.dict, packed.data(), e.col.codes.size(), code_bits, piecebuf.data());
+    voff.assign(e.nd + 1, 0);
+    size_t w = 0;
+    for (size_t k = 0; k < e.nd; ++k) {
+      uint32_t p = e.cl.prefix_len[k];
+      if (p > 0) {
+        uint32_t pi = e.prefix_piece[e.cl.chunk_first[k]];
+        std::memcpy(dictbuf.data() + w, piecebuf.data() + e.piece_off[pi], p);
+        w += p;
+      }
+      uint32_t sfx = static_cast<uint32_t>(e.n_prefix_pieces) + static_cast<uint32_t>(k);
+      size_t soff = e.piece_off[sfx], slen = e.piece_off[sfx + 1] - soff;
+      std::memcpy(dictbuf.data() + w, piecebuf.data() + soff, slen);
+      w += slen;
+      voff[k + 1] = static_cast<uint32_t>(w);
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < n; ++i) {
+      uint32_t k = e.sorted_pos[dd.refs[i]];
+      size_t off = voff[k], len = voff[k + 1] - off;
+      std::memcpy(out + o, dictbuf.data() + off, len);
+      o += len;
+    }
+    return o;
+  };
+
+  {
+    std::vector<uint8_t> piecebuf(piece_total + op::kDecodePadding, 0);
+    std::vector<uint8_t> dictbuf(distinct_total + 32, 0), out(cap);
+    std::vector<uint32_t> voff;
+    size_t w = decode(piecebuf, dictbuf, voff, out.data());
+    if (w != c.raw_bytes() || std::memcmp(out.data(), c.bytes.data(), c.raw_bytes()) != 0) {
+      std::fprintf(stderr, "OnPair+ roundtrip mismatch on %s (w=%zu raw=%zu)\n", c.name.c_str(), w,
+                   c.raw_bytes());
+      std::abort();
+    }
+  }
+  std::vector<double> dec_r;
+  for (int it = 0; it < kDecodeIters; ++it) {
+    std::vector<uint8_t> piecebuf(piece_total + op::kDecodePadding, 0);
+    std::vector<uint8_t> dictbuf(distinct_total + 32, 0), out(cap);
+    std::vector<uint32_t> voff;
+    auto t0 = Clock::now();
+    size_t w = decode(piecebuf, dictbuf, voff, out.data());
+    double dt = std::chrono::duration<double>(Clock::now() - t0).count();
+    asm volatile("" ::"r"(w) : "memory");
+    dec_r.push_back(Mib(c.raw_bytes()) / dt);
+  }
+  m.decode_mibs = Median(std::move(dec_r));
+  return m;
+}
+
 // TPC-H columns train with a 0.2 sample fraction; the URL corpus with 0.5
 // (matching the Rust harness).
 double ThresholdFor(const std::string& name) {
@@ -666,9 +1084,11 @@ int main(int argc, char** argv) {
     Measured op16 = RunOnPair(c, 16, threshold);
     Measured opauto = RunOnPairAuto(c, threshold);
     Measured op16d = RunOnPairDedup(c, 16, threshold);
+    Measured fsstp = RunFsstPlus(c);
+    Measured oppl = RunOnPairPlus(c, threshold);
 
     std::printf("%-26s %10zu %10.2f\n", c.name.c_str(), c.n_rows(), Mib(c.raw_bytes()));
-    for (const Measured* m : {&fsst, &zstd1, &lz4, &op16, &opauto, &op16d}) {
+    for (const Measured* m : {&fsst, &zstd1, &lz4, &op16, &opauto, &op16d, &fsstp, &oppl}) {
       double ratio = static_cast<double>(c.raw_bytes()) / static_cast<double>(m->compressed_bytes);
       std::printf("  %-24s %10s %10.2f  %7.3fx %9.1f %9.1f\n", m->label.c_str(), "",
                   Mib(m->compressed_bytes), ratio, m->encode_mibs, m->decode_mibs);
@@ -684,9 +1104,15 @@ int main(int argc, char** argv) {
                 (op16.encode_mibs / zstd1.encode_mibs - 1.0) * 100.0,
                 (op16.decode_mibs / zstd1.decode_mibs - 1.0) * 100.0);
     double r_op16d = static_cast<double>(c.raw_bytes()) / op16d.compressed_bytes;
-    std::printf("  -> OnPair16-dedup vs zstd(1): ratio %+.1f%%, decode %+.1f%%\n\n",
+    std::printf("  -> OnPair16-dedup vs zstd(1): ratio %+.1f%%, decode %+.1f%%\n",
                 (r_op16d / r_zstd - 1.0) * 100.0,
                 (op16d.decode_mibs / zstd1.decode_mibs - 1.0) * 100.0);
+    double r_fsstp = static_cast<double>(c.raw_bytes()) / fsstp.compressed_bytes;
+    double r_oppl = static_cast<double>(c.raw_bytes()) / oppl.compressed_bytes;
+    std::printf("  -> FSST+ vs FSST: ratio %+.1f%%; FSST+ vs zstd(1): ratio %+.1f%%\n",
+                (r_fsstp / r_fsst - 1.0) * 100.0, (r_fsstp / r_zstd - 1.0) * 100.0);
+    std::printf("  -> OnPair+ vs OnPair16-dedup: ratio %+.1f%%; OnPair+ vs zstd(1): ratio %+.1f%%\n\n",
+                (r_oppl / r_op16d - 1.0) * 100.0, (r_oppl / r_zstd - 1.0) * 100.0);
   }
   return 0;
 }
