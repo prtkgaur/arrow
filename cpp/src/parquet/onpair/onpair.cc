@@ -390,10 +390,16 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
 
   std::vector<uint32_t> order(n);
   std::iota(order.begin(), order.end(), 0u);
-  double sf = cfg.threshold_fraction;
-  size_t shuffle_k =
-      std::min(n, static_cast<size_t>(std::min(sf * 2.0, 1.0) * static_cast<double>(n)) + 1024);
-  PartialShuffle(&order, shuffle_k, cfg.seed);
+  // Full Fisher-Yates shuffle of the entire training order (D4 in onpair.h). The
+  // dynamic byte budget still stops scanning well before the end, so only a
+  // sample is trained on - but drawing that sample from a *full* shuffle avoids
+  // skew on sequentially-ordered columns. (The Rust reference crate partial-shuffles
+  // only ~0.3n rows and leaves them in the slice's TAIL while the trainer reads from
+  // the head, so on ordered data like Customer#000... it trains mostly on
+  // low-numbered rows and builds a skewed dictionary. This port already shuffles
+  // into the head; a full shuffle matches the reference C++ std::shuffle over all
+  // rows and removes any doubt.)
+  PartialShuffle(&order, n, cfg.seed);
 
   std::unordered_map<uint32_t, uint8_t> freq;
 

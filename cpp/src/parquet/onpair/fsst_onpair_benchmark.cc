@@ -391,8 +391,14 @@ size_t OnPairSize(const op::Column& col, const Corpus& c) {
 
 // OnPair with the dictionary bit-width chosen per column: try 9..16 and keep the
 // width that minimizes bit-packed size, then report that width's ratio/decode.
-// (A production encoder would pick the width from one training pass via the
-// token-gain curve; here we measure the achievable optimum directly.)
+// This exhaustive full-column sweep is the reliable way to pick the width. A
+// cheap "train on a sub-sample and project to full size" picker does NOT
+// reproduce it: training is not scale-invariant (the dynamic-threshold controller
+// paces against the input size, so a sub-sample yields a differently *shaped*
+// dictionary, not a smaller one), and enlarging the sample doesn't fix it - a
+// token-gain curve fitted on a sample inherits the same skew. A cheap picker
+// therefore needs a verify-against-the-ceiling fail-safe (train at the chosen
+// budget and the ceiling, keep whichever stores less), not blind trust.
 Measured RunOnPairAuto(const Corpus& c, double threshold) {
   size_t n = c.n_rows();
   uint8_t best_bits = 9;

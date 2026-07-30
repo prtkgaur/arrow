@@ -44,9 +44,13 @@
 //   D3. Static perfect-hash LPM. The paper finalizes long-pattern lookup with a
 //       minimal perfect hash for the read-only parsing phase (sec 3.4.3); this port
 //       keeps std::unordered_map (the paper notes that path is Rust-only).
-//   D4. Training-sample selection uses a fixed-seed splitmix64 partial
-//       Fisher-Yates shuffle (`PartialShuffle`); the exact RNG is not specified
-//       by the paper, so output is deterministic but not canonical.
+//   D4. Training-sample selection uses a fixed-seed splitmix64 *full*
+//       Fisher-Yates shuffle (`PartialShuffle` over all rows). Shuffle *extent*,
+//       not the RNG choice, is what affects the trained dictionary: a full
+//       shuffle avoids skew on sequentially-ordered columns (the Rust crate
+//       partial-shuffles only a tail prefix, skewing patterned data like
+//       Customer#000…). The exact RNG is not specified by the paper, so output
+//       is deterministic but not bit-identical to the crate.
 //
 // Little-endian hosts only.
 
