@@ -592,6 +592,46 @@ size_t DecompressPackedFixed(const CompactDictionary& dict, const uint8_t* packe
   return w;
 }
 
+// As above but with the code width a compile-time constant, so the mask folds to a
+// literal and `bitpos += kBits` strength-reduces. Dispatched once per stream, the
+// same way the copy width is.
+template <size_t kCopy, size_t kBits>
+size_t DecompressPackedFixedBits(const CompactDictionary& dict, const uint8_t* packed,
+                                 size_t ncodes, uint8_t* out) {
+  constexpr uint32_t kMask = (kBits >= 32) ? 0xFFFFFFFFu : ((uint32_t{1} << kBits) - 1);
+  size_t bitpos = 0, w = 0;
+  for (size_t i = 0; i < ncodes; ++i) {
+    uint32_t word;
+    std::memcpy(&word, packed + (bitpos >> 3), 4);
+    uint32_t code = (word >> (bitpos & 7)) & kMask;
+    bitpos += kBits;
+    const uint8_t* src = dict.token_ptr(static_cast<Token>(code));
+    size_t len = dict.token_len(static_cast<Token>(code));
+    std::memcpy(out + w, src, kCopy);
+    w += len;
+  }
+  return w;
+}
+
+// Resolve `bits` to a constant for the widths a trained dictionary can produce
+// (kMinDictBits..kMaxDictBits), falling back to the runtime-width loop otherwise so
+// no input is rejected.
+template <size_t kCopy>
+size_t DecompressPackedDispatchBits(const CompactDictionary& dict, const uint8_t* packed,
+                                    size_t ncodes, size_t bits, uint8_t* out) {
+  switch (bits) {
+    case 9: return DecompressPackedFixedBits<kCopy, 9>(dict, packed, ncodes, out);
+    case 10: return DecompressPackedFixedBits<kCopy, 10>(dict, packed, ncodes, out);
+    case 11: return DecompressPackedFixedBits<kCopy, 11>(dict, packed, ncodes, out);
+    case 12: return DecompressPackedFixedBits<kCopy, 12>(dict, packed, ncodes, out);
+    case 13: return DecompressPackedFixedBits<kCopy, 13>(dict, packed, ncodes, out);
+    case 14: return DecompressPackedFixedBits<kCopy, 14>(dict, packed, ncodes, out);
+    case 15: return DecompressPackedFixedBits<kCopy, 15>(dict, packed, ncodes, out);
+    case 16: return DecompressPackedFixedBits<kCopy, 16>(dict, packed, ncodes, out);
+    default: return DecompressPackedFixed<kCopy>(dict, packed, ncodes, bits, out);
+  }
+}
+
 }  // namespace
 
 size_t DecompressPacked(const CompactDictionary& dict, const uint8_t* packed, size_t ncodes,
@@ -608,9 +648,9 @@ size_t DecompressPacked(const CompactDictionary& dict, const uint8_t* packed, si
   //
   // `out` needs kDecodePadding of slack either way, and dict.bytes is read-padded
   // by kMaxTokenSize, so every width here is in bounds.
-  if (maxlen <= 4) return DecompressPackedFixed<4>(dict, packed, ncodes, bits, out);
-  if (maxlen <= 8) return DecompressPackedFixed<8>(dict, packed, ncodes, bits, out);
-  return DecompressPackedFixed<kMaxTokenSize>(dict, packed, ncodes, bits, out);
+  if (maxlen <= 4) return DecompressPackedDispatchBits<4>(dict, packed, ncodes, bits, out);
+  if (maxlen <= 8) return DecompressPackedDispatchBits<8>(dict, packed, ncodes, bits, out);
+  return DecompressPackedDispatchBits<kMaxTokenSize>(dict, packed, ncodes, bits, out);
 }
 
 }  // namespace parquet::onpair
