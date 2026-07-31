@@ -595,6 +595,15 @@ size_t DecompressPackedFixed(const CompactDictionary& dict, const uint8_t* packe
 // As above but with the code width a compile-time constant, so the mask folds to a
 // literal and `bitpos += kBits` strength-reduces. Dispatched once per stream, the
 // same way the copy width is.
+//
+// Tried and rejected here, so it is not re-attempted: unpacking codes a block at a
+// time before gathering, to break the `w += len` store-address dependency and to
+// prefetch the token bytes. It lost 22% with the offsets prefetched and 41% with
+// dict.bytes prefetched (worst case -65%), across all 20 corpora. The premise was
+// wrong -- this loop is store-bound, not latency-bound, which is the same thing the
+// copy-width measurement showed. Breaking a dependency chain buys nothing against a
+// store-bandwidth limit, and the extra pass plus 64 prefetches per block only add
+// traffic.
 template <size_t kCopy, size_t kBits>
 size_t DecompressPackedFixedBits(const CompactDictionary& dict, const uint8_t* packed,
                                  size_t ncodes, uint8_t* out) {
