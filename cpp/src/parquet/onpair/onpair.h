@@ -94,6 +94,32 @@ struct CompactDictionary {
   std::vector<uint8_t> bytes;    // read-padded
   std::vector<uint32_t> offsets;  // length num_tokens + 1
 
+  /// Length of the longest token present, which is what the decoder's gather-copy
+  /// sizes its fixed copy width from. Often well below kMaxTokenSize: TPC-H
+  /// c_address tops out at 5 bytes, and copying 16 there moves 8x the bytes it
+  /// needs to.
+  ///
+  /// This must never UNDERSTATE the true maximum -- doing so would make the
+  /// decoder copy less than a token's length and silently truncate. It therefore
+  /// defaults to the conservative kMaxTokenSize, so a dictionary that never calls
+  /// RecomputeMaxTokenLen still decodes correctly and merely forgoes the
+  /// narrowing. A stored format would carry this in its header rather than
+  /// recompute it, which is why the decoder reads it instead of scanning: an
+  /// O(tokens) scan per decode call costs 1-3% on dictionaries of 20-60k tokens.
+  size_t max_token_len = kMaxTokenSize;
+
+  /// Derive max_token_len from `offsets`. Call after building or replacing them.
+  void RecomputeMaxTokenLen() {
+    size_t m = 0;
+    for (size_t t = 0; t + 1 < offsets.size(); ++t) {
+      const size_t len = offsets[t + 1] - offsets[t];
+      if (len > m) m = len;
+    }
+    // An empty dictionary decodes nothing; stay conservative rather than pick a
+    // width from no evidence.
+    max_token_len = m == 0 ? kMaxTokenSize : m;
+  }
+
   size_t num_tokens() const { return offsets.empty() ? 0 : offsets.size() - 1; }
   const uint8_t* token_ptr(Token id) const { return bytes.data() + offsets[id]; }
   size_t token_len(Token id) const { return offsets[id + 1] - offsets[id]; }

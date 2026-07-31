@@ -472,6 +472,7 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
   CompactDictionary dict;
   dict.bytes = std::move(sorted_bytes);
   dict.offsets = std::move(sorted_offsets);
+  dict.RecomputeMaxTokenLen();
   LongestPrefixMatcher final_lpm = LongestPrefixMatcher::FromDictionary(dict);
   return TrainResult{std::move(dict), std::move(final_lpm)};
 }
@@ -516,16 +517,30 @@ size_t DecodedLen(const Column& col) {
   return sum;
 }
 
-size_t DecompressInto(const Column& col, uint8_t* out) {
+namespace {
+
+// Shared body of DecompressInto, parameterised on the gather-copy width for the
+// same reason DecompressPackedFixed is. See CompactDictionary::max_token_len.
+template <size_t kCopy>
+size_t DecompressIntoFixed(const Column& col, uint8_t* out) {
   const CompactDictionary& dict = col.dict;
   size_t w = 0;
   for (uint16_t code : col.codes) {
     const uint8_t* src = dict.token_ptr(code);
     size_t len = dict.token_len(code);
-    std::memcpy(out + w, src, kMaxTokenSize);  // fixed 16-byte over-copy
+    std::memcpy(out + w, src, kCopy);  // fixed over-copy, kCopy >= every token
     w += len;
   }
   return w;
+}
+
+}  // namespace
+
+size_t DecompressInto(const Column& col, uint8_t* out) {
+  const size_t maxlen = col.dict.max_token_len;
+  if (maxlen <= 4) return DecompressIntoFixed<4>(col, out);
+  if (maxlen <= 8) return DecompressIntoFixed<8>(col, out);
+  return DecompressIntoFixed<kMaxTokenSize>(col, out);
 }
 
 std::vector<uint8_t> PackValues(const uint32_t* vals, size_t n, size_t bits) {
@@ -542,8 +557,26 @@ std::vector<uint8_t> PackValues(const uint32_t* vals, size_t n, size_t bits) {
   return out;
 }
 
-size_t DecompressPacked(const CompactDictionary& dict, const uint8_t* packed, size_t ncodes,
-                        size_t bits, uint8_t* out) {
+namespace {
+
+// The gather-copy writes a fixed width per token so the copy length is a compile
+// time constant, but that width only has to cover the longest token this
+// dictionary actually holds -- not kMaxTokenSize. On corpora whose tokens are
+// short the difference dominates decode: c_address averages 1.99 bytes per token,
+// so a 16-byte copy moves 8x the bytes it needs to.
+//
+// Measured, this loop is store-bandwidth-bound. Across five unrelated corpora
+// (over-copy factor) x (decode MiB/s) came out constant at ~10.6 GiB/s of store
+// traffic, and the corpora with the highest over-copy decode slowest. Narrowing
+// the width is therefore worth close to the bytes it saves.
+//
+// The width is chosen once per stream from the dictionary, so there is no
+// per-token branch: a predicate on token length would be nearly free on corpora
+// where it always goes one way and expensive on the ones that split (urls sit at
+// 41% short, the worst possible mix).
+template <size_t kCopy>
+size_t DecompressPackedFixed(const CompactDictionary& dict, const uint8_t* packed, size_t ncodes,
+                             size_t bits, uint8_t* out) {
   size_t bitpos = 0, w = 0;
   const uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1);
   for (size_t i = 0; i < ncodes; ++i) {
@@ -553,10 +586,31 @@ size_t DecompressPacked(const CompactDictionary& dict, const uint8_t* packed, si
     bitpos += bits;
     const uint8_t* src = dict.token_ptr(static_cast<Token>(code));
     size_t len = dict.token_len(static_cast<Token>(code));
-    std::memcpy(out + w, src, kMaxTokenSize);  // fixed 16-byte over-copy
+    std::memcpy(out + w, src, kCopy);  // fixed over-copy, kCopy >= every token
     w += len;
   }
   return w;
+}
+
+}  // namespace
+
+size_t DecompressPacked(const CompactDictionary& dict, const uint8_t* packed, size_t ncodes,
+                        size_t bits, uint8_t* out) {
+  // Read the width, do not scan for it: an O(tokens) scan here costs 1-3% on
+  // dictionaries of 20-60k tokens, which is charged to decode for something a
+  // stored format keeps in its header. See CompactDictionary::max_token_len.
+  const size_t maxlen = dict.max_token_len;
+  // Only widths a single store can carry. A 12-byte copy moves 25% fewer bytes
+  // than 16 but needs two stores, and measured that loses 4-6% on every corpus it
+  // applied to (c_mktsegment, c_phone, p_container) -- so this is not purely a
+  // bandwidth effect and one wide store beats two narrow ones. Narrowing to 8 is
+  // worth 25-28% on the corpora that allow it.
+  //
+  // `out` needs kDecodePadding of slack either way, and dict.bytes is read-padded
+  // by kMaxTokenSize, so every width here is in bounds.
+  if (maxlen <= 4) return DecompressPackedFixed<4>(dict, packed, ncodes, bits, out);
+  if (maxlen <= 8) return DecompressPackedFixed<8>(dict, packed, ncodes, bits, out);
+  return DecompressPackedFixed<kMaxTokenSize>(dict, packed, ncodes, bits, out);
 }
 
 }  // namespace parquet::onpair
