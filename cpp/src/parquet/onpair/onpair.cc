@@ -599,15 +599,22 @@ template <size_t kCopy, size_t kBits>
 size_t DecompressPackedFixedBits(const CompactDictionary& dict, const uint8_t* packed,
                                  size_t ncodes, uint8_t* out) {
   constexpr uint32_t kMask = (kBits >= 32) ? 0xFFFFFFFFu : ((uint32_t{1} << kBits) - 1);
+  const uint8_t* offsets_raw = reinterpret_cast<const uint8_t*>(dict.offsets.data());
+  const uint8_t* dict_bytes = dict.bytes.data();
   size_t bitpos = 0, w = 0;
   for (size_t i = 0; i < ncodes; ++i) {
     uint32_t word;
     std::memcpy(&word, packed + (bitpos >> 3), 4);
     uint32_t code = (word >> (bitpos & 7)) & kMask;
     bitpos += kBits;
-    const uint8_t* src = dict.token_ptr(static_cast<Token>(code));
-    size_t len = dict.token_len(static_cast<Token>(code));
-    std::memcpy(out + w, src, kCopy);
+    // offsets[code] and offsets[code + 1] are adjacent u32s, so one 8-byte load
+    // yields the token's start and end together. token_ptr/token_len would issue
+    // two loads for what is almost always a single cache line.
+    uint64_t pair;
+    std::memcpy(&pair, offsets_raw + size_t{code} * sizeof(uint32_t), sizeof(pair));
+    const uint32_t start = static_cast<uint32_t>(pair);
+    const size_t len = static_cast<uint32_t>(pair >> 32) - start;
+    std::memcpy(out + w, dict_bytes + start, kCopy);
     w += len;
   }
   return w;
