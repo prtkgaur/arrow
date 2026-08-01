@@ -393,6 +393,217 @@ size_t DecodeOnPairPayload(const uint8_t* p, size_t /*size*/, uint8_t* out) {
   return op::DecompressPacked(dict, packed_codes, num_codes, code_bits, out);
 }
 
+// Group A codec 3: dictionary-encode, then OnPair the distinct values.
+//
+// The layout a columnar format uses for repetitive columns: bit-packed references
+// into the distinct set, with OnPair run over only the distinct values. Measured
+// here as well as in the companion benchmark so that a decode number for it can
+// sit in the same table as the Parquet-native pages, which are 4.6-7.5% slower in
+// this binary.
+//
+// Payload: [u32 distinct][u32 rows][u32 distinct_bytes][u8 ref_bits][u8 dlen_bits]
+//          [pad*2][OnPair payload of the distinct set][packed distinct lengths]
+//          [packed row references]
+//
+// Note what is NOT charged: the per-row length array. Row lengths are recovered
+// from a row's reference plus the distinct-value lengths, so charging both would
+// count boundaries twice. This matches the companion benchmark's accounting.
+
+// Allocation-free byte-range hash, 8 bytes per step plus a tail and a final
+// avalanche -- cheaper than byte-at-a-time for the short values that dominate
+// low-cardinality columns. Same function the companion benchmark uses, so both
+// binaries build the identical distinct set in the identical order.
+inline uint64_t HashBytes(const uint8_t* p, size_t len) {
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ (static_cast<uint64_t>(len) * 0xff51afd7ed558ccdull);
+  size_t i = 0;
+  for (; i + 8 <= len; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    h = (h ^ w) * 0x100000001b3ull;
+  }
+  if (i < len) {
+    uint64_t w = 0;
+    std::memcpy(&w, p + i, len - i);
+    h = (h ^ w) * 0x100000001b3ull;
+  }
+  h ^= h >> 29;
+  h *= 0xbf58476d1ce4e5b9ull;
+  h ^= h >> 32;
+  return h;
+}
+
+struct DedupSet {
+  std::vector<uint8_t> bytes;      // distinct values, concatenated in first-seen order
+  std::vector<uint32_t> offsets;   // n_distinct + 1
+  std::vector<uint32_t> refs;      // one per row
+  size_t n_distinct = 0;
+};
+
+// Open-addressing (linear-probe) table keyed on the row bytes, assigning ids in
+// first-seen order -- the same distinct set and order an unordered_map would
+// give, so ratios match, without per-key allocation.
+DedupSet BuildDedupSet(const Corpus& c) {
+  size_t n = c.n_rows();
+  DedupSet d;
+  size_t cap = 1;
+  while (cap < n * 2) cap <<= 1;  // power of two, <=50% load
+  const uint32_t kEmpty = 0xFFFFFFFFu;
+  std::vector<uint32_t> table(cap, kEmpty);
+  uint64_t mask = cap - 1;
+  d.offsets.push_back(0);
+  d.refs.resize(n);
+  uint32_t n_distinct = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* row = c.bytes.data() + c.offsets[i];
+    size_t len = c.offsets[i + 1] - c.offsets[i];
+    uint64_t slot = HashBytes(row, len) & mask;
+    uint32_t id;
+    for (;;) {
+      uint32_t cur = table[slot];
+      if (cur == kEmpty) {
+        id = n_distinct++;
+        table[slot] = id;
+        d.bytes.insert(d.bytes.end(), row, row + len);
+        d.offsets.push_back(static_cast<uint32_t>(d.bytes.size()));
+        break;
+      }
+      size_t off = d.offsets[cur];
+      size_t clen = d.offsets[cur + 1] - off;
+      if (clen == len && std::memcmp(d.bytes.data() + off, row, len) == 0) {
+        id = cur;
+        break;
+      }
+      slot = (slot + 1) & mask;  // linear probe
+    }
+    d.refs[i] = id;
+  }
+  d.n_distinct = n_distinct;
+  return d;
+}
+
+constexpr size_t kDictOnPairHeader = 16;
+
+std::vector<uint8_t> BuildDictOnPairPayload(const Corpus& c, const op::Config& cfg) {
+  DedupSet d = BuildDedupSet(c);
+  op::Column col = op::Compress(d.bytes.data(), d.bytes.size(), d.offsets.data(),
+                                d.n_distinct, cfg);
+  size_t dict_bytes = col.dict.logical_bytes();
+  size_t code_bits = IndexBits(col.dict.num_tokens());
+  size_t off_bits = std::max<size_t>(1, BitWidth(dict_bytes));
+
+  size_t dmax = 0;
+  for (size_t j = 0; j + 1 < d.offsets.size(); ++j)
+    dmax = std::max<size_t>(dmax, d.offsets[j + 1] - d.offsets[j]);
+  size_t dlen_bits = std::max<size_t>(1, BitWidth(dmax));
+  size_t ref_bits = IndexBits(d.n_distinct);
+
+  std::vector<uint8_t> v;
+  PutU32(&v, static_cast<uint32_t>(d.n_distinct));
+  PutU32(&v, static_cast<uint32_t>(c.n_rows()));
+  PutU32(&v, static_cast<uint32_t>(d.bytes.size()));
+  v.push_back(static_cast<uint8_t>(ref_bits));
+  v.push_back(static_cast<uint8_t>(dlen_bits));
+  v.push_back(0);
+  v.push_back(0);
+
+  PutU32(&v, static_cast<uint32_t>(col.dict.num_tokens()));
+  PutU32(&v, static_cast<uint32_t>(dict_bytes));
+  PutU32(&v, static_cast<uint32_t>(col.codes.size()));
+  v.push_back(static_cast<uint8_t>(code_bits));
+  v.push_back(static_cast<uint8_t>(off_bits));
+  v.push_back(0);
+  v.push_back(0);
+
+  v.insert(v.end(), col.dict.bytes.begin(), col.dict.bytes.begin() + dict_bytes);
+
+  std::vector<uint32_t> offs(col.dict.offsets.begin(), col.dict.offsets.end());
+  std::vector<uint8_t> packed_offs = op::PackValues(offs.data(), offs.size(), off_bits);
+  packed_offs.resize(BitPackedBytes(offs.size(), off_bits));
+  v.insert(v.end(), packed_offs.begin(), packed_offs.end());
+
+  std::vector<uint32_t> cw(col.codes.begin(), col.codes.end());
+  std::vector<uint8_t> packed_codes = op::PackValues(cw.data(), cw.size(), code_bits);
+  packed_codes.resize(BitPackedBytes(cw.size(), code_bits));
+  v.insert(v.end(), packed_codes.begin(), packed_codes.end());
+
+  std::vector<uint32_t> dlens(d.n_distinct);
+  for (size_t j = 0; j < d.n_distinct; ++j) dlens[j] = d.offsets[j + 1] - d.offsets[j];
+  std::vector<uint8_t> packed_dlens = op::PackValues(dlens.data(), dlens.size(), dlen_bits);
+  packed_dlens.resize(BitPackedBytes(dlens.size(), dlen_bits));
+  v.insert(v.end(), packed_dlens.begin(), packed_dlens.end());
+
+  std::vector<uint8_t> packed_refs = op::PackValues(d.refs.data(), d.refs.size(), ref_bits);
+  packed_refs.resize(BitPackedBytes(d.refs.size(), ref_bits));
+  v.insert(v.end(), packed_refs.begin(), packed_refs.end());
+  return v;
+}
+
+// Materialize the distinct values (one OnPair decode), rebuild their offsets from
+// the packed length array, then gather rows by unpacking each reference. Values of
+// <=16 bytes take one branchless 128-bit store; `scratch` and `out` are padded.
+//
+// Unlike the companion benchmark, the offset rebuild is inside the timed region:
+// this payload is self-describing, so a reader really does pay it. The difference
+// is a prefix sum over the distinct set, which is negligible where dedup wins and
+// only matters on all-distinct columns, where dedup loses regardless.
+size_t DecodeDictOnPairPayload(const uint8_t* p, uint8_t* out,
+                               std::vector<uint8_t>* scratch) {
+  size_t n_distinct = GetU32(p);
+  size_t n_rows = GetU32(p + 4);
+  size_t distinct_bytes = GetU32(p + 8);
+  size_t ref_bits = p[12];
+  size_t dlen_bits = p[13];
+
+  const uint8_t* q = p + kDictOnPairHeader;
+  size_t num_tokens = GetU32(q);
+  size_t dict_bytes = GetU32(q + 4);
+  size_t num_codes = GetU32(q + 8);
+  size_t code_bits = q[12];
+  size_t off_bits = q[13];
+
+  const uint8_t* dict_blob = q + kOnPairHeader;
+  const uint8_t* packed_offs = dict_blob + dict_bytes;
+  const uint8_t* packed_codes = packed_offs + BitPackedBytes(num_tokens + 1, off_bits);
+  const uint8_t* packed_dlens = packed_codes + BitPackedBytes(num_codes, code_bits);
+  const uint8_t* packed_refs = packed_dlens + BitPackedBytes(n_distinct, dlen_bits);
+
+  op::CompactDictionary dict;
+  dict.bytes.resize(dict_bytes + op::kDecodePadding, 0);
+  std::memcpy(dict.bytes.data(), dict_blob, dict_bytes);
+  dict.offsets.resize(num_tokens + 1);
+  for (size_t t = 0; t <= num_tokens; ++t) {
+    dict.offsets[t] = op::GetBits(packed_offs, t * off_bits, off_bits);
+  }
+  dict.RecomputeMaxTokenLen();
+
+  if (scratch->size() < distinct_bytes + op::kDecodePadding) {
+    scratch->assign(distinct_bytes + op::kDecodePadding, 0);
+  }
+  op::DecompressPacked(dict, packed_codes, num_codes, code_bits, scratch->data());
+
+  std::vector<uint32_t> doff(n_distinct + 1);
+  doff[0] = 0;
+  for (size_t j = 0; j < n_distinct; ++j) {
+    doff[j + 1] = doff[j] + op::GetBits(packed_dlens, j * dlen_bits, dlen_bits);
+  }
+
+  const uint8_t* dbuf = scratch->data();
+  size_t w = 0, bp = 0;
+  for (size_t i = 0; i < n_rows; ++i) {
+    uint32_t id = op::GetBits(packed_refs, bp, ref_bits);
+    bp += ref_bits;
+    size_t off = doff[id];
+    size_t len = doff[id + 1] - off;
+    if (len <= 16) {
+      std::memcpy(out + w, dbuf + off, 16);
+    } else {
+      std::memcpy(out + w, dbuf + off, len);
+    }
+    w += len;
+  }
+  return w;
+}
+
 // Group B: Parquet's own byte-array encodings, through the real encoder/decoder.
 
 std::shared_ptr<parquet::ColumnDescriptor> ByteArrayDescr() {
@@ -545,15 +756,22 @@ int main(int argc, char** argv) {
     const size_t out_cap = c.raw_bytes() + op::kDecodePadding + kPad;
 
     op::Config cfg{PickOnPairBits(c, threshold), threshold, 42};
+    op::Config cfg16{16, threshold, 42};
+    std::vector<uint8_t> dop_scratch;
 
     auto fsst_build = [&] { return BuildFsstPayload(c); };
     auto fsst_decode = [&](const uint8_t* p, size_t s, uint8_t* o) {
       return DecodeFsstPayload(p, s, o, out_cap);
     };
     auto op_build = [&] { return BuildOnPairPayload(c, cfg, /*byte_aligned=*/false); };
+    auto op16_build = [&] { return BuildOnPairPayload(c, cfg16, /*byte_aligned=*/false); };
     auto opba_build = [&] { return BuildOnPairPayload(c, cfg, /*byte_aligned=*/true); };
     auto op_decode = [&](const uint8_t* p, size_t s, uint8_t* o) {
       return DecodeOnPairPayload(p, s, o);
+    };
+    auto dop_build = [&] { return BuildDictOnPairPayload(c, cfg16); };
+    auto dop_decode = [&](const uint8_t* p, size_t /*s*/, uint8_t* o) {
+      return DecodeDictOnPairPayload(p, o, &dop_scratch);
     };
     auto concat_build = [&] { return BuildConcatPayload(c, /*with_lengths=*/true); };
     auto bytes_build = [&] { return BuildConcatPayload(c, /*with_lengths=*/false); };
@@ -589,6 +807,8 @@ int main(int argc, char** argv) {
     ms.push_back(RunCodec(c, "lz4 [len in page]", Generic::kLz4, concat_build, concat_decode));
     ms.push_back(RunCodec(c, "FSST", Generic::kNone, fsst_build, fsst_decode));
     ms.push_back(RunCodec(c, "OnPair-auto", Generic::kNone, op_build, op_decode));
+    ms.push_back(RunCodec(c, "OnPair16", Generic::kNone, op16_build, op_decode));
+    ms.push_back(RunCodec(c, "DICT+OnPair", Generic::kNone, dop_build, dop_decode));
 
     // Group A: cascade a generic codec over FSST / OnPair.
     ms.push_back(RunCodec(c, "FSST+zstd(1)", Generic::kZstd1, fsst_build, fsst_decode));
