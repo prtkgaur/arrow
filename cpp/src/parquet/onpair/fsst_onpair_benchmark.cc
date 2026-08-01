@@ -44,88 +44,18 @@
 #include <vector>
 
 #include "fsst.h"
+#include "parquet/onpair/bench_common.h"
 #include "parquet/onpair/onpair.h"
 #include "parquet/onpair/prefix_plus.h"
 
-// zstd: declare the small, ABI-stable subset we use so the standalone build
-// needs only the installed libzstd (no dev header). Link libzstd.so directly.
-extern "C" {
-size_t ZSTD_compress(void* dst, size_t dstCapacity, const void* src, size_t srcSize, int level);
-size_t ZSTD_decompress(void* dst, size_t dstCapacity, const void* src, size_t compressedSize);
-size_t ZSTD_compressBound(size_t srcSize);
-unsigned ZSTD_isError(size_t code);
-// lz4 (fast block compressor) - ABI-stable subset; link the installed liblz4.
-int LZ4_compressBound(int inputSize);
-int LZ4_compress_default(const char* src, char* dst, int srcSize, int dstCapacity);
-int LZ4_decompress_safe(const char* src, char* dst, int compressedSize, int dstCapacity);
-}
-
 namespace op = parquet::onpair;
-using Clock = std::chrono::steady_clock;
 
 namespace {
 
-constexpr int kEncodeIters = 3;
-constexpr int kDecodeIters = 10;
-
-double Mib(size_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
-
-double Median(std::vector<double> v) {
-  std::sort(v.begin(), v.end());
-  return v[v.size() / 2];
-}
-
-// A packed corpus: concatenated bytes + (n+1) u32 offsets.
-// Bits to store a value in [0, x]  (x==0 -> 0 bits).
-inline size_t BitWidth(uint64_t x) {
-  return x == 0 ? 0 : 64 - static_cast<size_t>(__builtin_clzll(x));
-}
-// Bits to index `count` distinct symbols [0, count)  (== ceil(log2 count), >=1).
-inline size_t IndexBits(size_t count) {
-  return count <= 1 ? 1 : (64 - static_cast<size_t>(__builtin_clzll(static_cast<uint64_t>(count - 1))));
-}
-inline size_t BitPackedBytes(size_t n, size_t bits) { return (n * bits + 7) / 8; }
-
-struct Corpus {
-  std::string name;
-  std::vector<uint8_t> bytes;
-  std::vector<uint32_t> offsets;
-  size_t n_rows() const { return offsets.size() - 1; }
-  size_t raw_bytes() const { return bytes.size(); }
-  size_t max_row_len() const {
-    size_t m = 0;
-    for (size_t i = 0; i < n_rows(); ++i) m = std::max<size_t>(m, offsets[i + 1] - offsets[i]);
-    return m;
-  }
-  // Realistic per-row row-length side array (delta offsets), bit-packed at the
-  // width of the longest row. Charged to every value-preserving codec (FSST,
-  // zstd, lz4, OnPair) so the row boundaries are accounted the way a real
-  // columnar format stores them - not as raw (n+1) u32.
-  size_t len_array_bytes() const {
-    return BitPackedBytes(n_rows(), std::max<size_t>(1, BitWidth(max_row_len())));
-  }
-};
-
-// Read a newline-delimited file (one row per line) into a packed corpus.
-Corpus ReadCorpus(const std::filesystem::path& path) {
-  Corpus c;
-  c.name = path.stem().string();
-  std::ifstream in(path, std::ios::binary);
-  c.offsets.push_back(0);
-  std::string line;
-  while (std::getline(in, line)) {
-    c.bytes.insert(c.bytes.end(), line.begin(), line.end());
-    c.offsets.push_back(static_cast<uint32_t>(c.bytes.size()));
-  }
-  return c;
-}
-
-struct Measured {
-  std::string label;
-  size_t compressed_bytes = 0;
-  double encode_mibs = 0;
-  double decode_mibs = 0;
-};
+// Corpus / Measured / Mib / Median / BitWidth / IndexBits / BitPackedBytes /
+// Clock / the iteration counts / ThresholdFor - shared with cascade_benchmark.cc
+// so both binaries account bytes identically.
+using namespace bench;  // NOLINT(build/namespaces)
 
 // FSST
 
@@ -1048,29 +978,11 @@ Measured RunOnPairPlus(const Corpus& c, double threshold) {
   return m;
 }
 
-// TPC-H columns train with a 0.2 sample fraction; the URL corpus with 0.5
-// (matching the Rust harness).
-double ThresholdFor(const std::string& name) {
-  return name.rfind("tpch_", 0) == 0 ? 0.2 : 0.5;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string dir;
-  if (argc > 1) {
-    dir = argv[1];
-  } else if (const char* env = std::getenv("ONPAIR_BENCH_DIR")) {
-    dir = env;
-  } else {
-    dir = "bench-fsst-onpair/corpora";
-  }
-
-  std::vector<std::filesystem::path> files;
-  for (const auto& e : std::filesystem::directory_iterator(dir)) {
-    if (e.path().extension() == ".txt") files.push_back(e.path());
-  }
-  std::sort(files.begin(), files.end());
+  std::string dir = CorpusDir(argc, argv);
+  std::vector<std::filesystem::path> files = CorpusFiles(dir);
   if (files.empty()) {
     std::fprintf(stderr, "no .txt corpora in %s\n", dir.c_str());
     return 1;
