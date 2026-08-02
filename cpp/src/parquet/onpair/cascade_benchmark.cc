@@ -538,6 +538,28 @@ std::vector<uint8_t> BuildDictOnPairPayload(const Corpus& c, const op::Config& c
   return v;
 }
 
+// The dedup cascade's own budget sweep. PickOnPairBits cannot be reused: it scores
+// OnPairSize over the whole column, whereas this payload trains OnPair over the
+// *distinct set* and then adds packed references and distinct-value lengths, so
+// the width that stores the column least is not the width that stores this least.
+//
+// It scores the assembled payload rather than a size formula on purpose -- the
+// payload has five sections, and a parallel formula would drift from
+// BuildDictOnPairPayload the first time either one changed. The build is wasted
+// work, but this runs in per-corpus setup, not in the timed region.
+uint8_t PickDictOnPairBits(const Corpus& c, double threshold) {
+  uint8_t best_bits = 9;
+  size_t best_sz = SIZE_MAX;
+  for (uint8_t b = 9; b <= 16; ++b) {
+    size_t sz = BuildDictOnPairPayload(c, op::Config{b, threshold, 42}).size();
+    if (sz < best_sz) {
+      best_sz = sz;
+      best_bits = b;
+    }
+  }
+  return best_bits;
+}
+
 // Materialize the distinct values (one OnPair decode), rebuild their offsets from
 // the packed length array, then gather rows by unpacking each reference. Values of
 // <=16 bytes take one branchless 128-bit store; `scratch` and `out` are padded.
@@ -661,12 +683,22 @@ size_t DecodePqPayload(const Corpus& c, parquet::Encoding::type e, const uint8_t
 // RLE_DICTIONARY is two streams -- a dictionary page and an index page -- so the
 // payload concatenates them behind a header, and both are charged.
 //
-// Payload: [u32 dict_bytes][u32 idx_bytes][u32 num_entries][pad*4][dict page][indices]
+// Payload: [u32 dict_bytes][u32 idx_bytes][u32 num_entries][u32 dict page encoding]
+//          [dict page][indices]
+//
+// `dict_page_enc` is PLAIN for the RLE_DICTIONARY rows, which is the only thing a
+// writer may emit: a BYTE_ARRAY dictionary page is PLAIN-encoded by spec. Passing
+// anything else measures a *hypothetical* format change -- the fair opponent for
+// replacing the dictionary page with an OnPair blob, since both ask the same
+// question of the spec. It is stored in the header rather than threaded through
+// the decode lambda so the payload stays self-describing; the word it occupies
+// was already there as padding, so the RLE_DICTIONARY sizes do not move.
 constexpr size_t kDictHeader = 16;
 
 std::vector<uint8_t> BuildDictPayload(const Corpus& c,
                                       const std::vector<parquet::ByteArray>& vals,
-                                      const parquet::ColumnDescriptor* descr) {
+                                      const parquet::ColumnDescriptor* descr,
+                                      parquet::Encoding::type dict_page_enc) {
   auto base = parquet::MakeEncoder(parquet::Type::BYTE_ARRAY, parquet::Encoding::PLAIN,
                                    /*use_dictionary=*/true, descr);
   auto* enc = dynamic_cast<parquet::TypedEncoder<parquet::ByteArrayType>*>(base.get());
@@ -676,6 +708,7 @@ std::vector<uint8_t> BuildDictPayload(const Corpus& c,
   size_t dict_bytes = static_cast<size_t>(dict_enc->dict_encoded_size());
   std::vector<uint8_t> dict_page(dict_bytes);
   dict_enc->WriteDict(dict_page.data());
+  int num_entries = dict_enc->num_entries();
 
   std::vector<uint8_t> idx(static_cast<size_t>(enc->EstimatedDataEncodedSize()) + 16);
   int idx_bytes = dict_enc->WriteIndices(idx.data(), static_cast<int>(idx.size()));
@@ -684,12 +717,32 @@ std::vector<uint8_t> BuildDictPayload(const Corpus& c,
     std::abort();
   }
 
+  // Re-encode the dictionary entries under another encoding. The detour through
+  // PLAIN is unavoidable: WriteDict is the only public way to get the entries in
+  // id order, and that order has to survive or the index stream stops matching.
+  // It makes this variant's *encode* throughput pessimistic -- a writer for such
+  // a format would encode the entries once -- but leaves ratio and decode exact.
+  if (dict_page_enc != parquet::Encoding::PLAIN) {
+    auto pd = parquet::MakeTypedDecoder<parquet::ByteArrayType>(parquet::Encoding::PLAIN);
+    pd->SetData(num_entries, dict_page.data(), static_cast<int>(dict_bytes));
+    std::vector<parquet::ByteArray> entries(num_entries);
+    if (pd->Decode(entries.data(), num_entries) != num_entries) {
+      std::fprintf(stderr, "dictionary page re-encode: short read\n");
+      std::abort();
+    }
+    auto re = parquet::MakeTypedEncoder<parquet::ByteArrayType>(dict_page_enc);
+    re->Put(entries.data(), num_entries);
+    auto buf = re->FlushValues();
+    dict_page.assign(buf->data(), buf->data() + buf->size());
+    dict_bytes = dict_page.size();
+  }
+
   std::vector<uint8_t> v;
   v.reserve(kDictHeader + dict_bytes + static_cast<size_t>(idx_bytes));
   PutU32(&v, static_cast<uint32_t>(dict_bytes));
   PutU32(&v, static_cast<uint32_t>(idx_bytes));
-  PutU32(&v, static_cast<uint32_t>(dict_enc->num_entries()));
-  PutU32(&v, 0);
+  PutU32(&v, static_cast<uint32_t>(num_entries));
+  PutU32(&v, static_cast<uint32_t>(dict_page_enc));
   v.insert(v.end(), dict_page.begin(), dict_page.end());
   v.insert(v.end(), idx.begin(), idx.begin() + idx_bytes);
   return v;
@@ -700,10 +753,13 @@ size_t DecodeDictPayload(const Corpus& c, const parquet::ColumnDescriptor* descr
   size_t dict_bytes = GetU32(p);
   size_t idx_bytes = GetU32(p + 4);
   int num_entries = static_cast<int>(GetU32(p + 8));
+  auto dict_page_enc = static_cast<parquet::Encoding::type>(GetU32(p + 12));
   const uint8_t* dict_page = p + kDictHeader;
   const uint8_t* idx = dict_page + dict_bytes;
 
-  auto dict_dec = parquet::MakeTypedDecoder<parquet::ByteArrayType>(parquet::Encoding::PLAIN);
+  // SetDict below takes any TypedDecoder, so the dictionary page's encoding is
+  // free to vary while the index path stays identical.
+  auto dict_dec = parquet::MakeTypedDecoder<parquet::ByteArrayType>(dict_page_enc);
   dict_dec->SetData(num_entries, dict_page, static_cast<int>(dict_bytes));
 
   int n = static_cast<int>(c.n_rows());
@@ -757,6 +813,7 @@ int main(int argc, char** argv) {
 
     op::Config cfg{PickOnPairBits(c, threshold), threshold, 42};
     op::Config cfg16{16, threshold, 42};
+    op::Config cfg_dop{PickDictOnPairBits(c, threshold), threshold, 42};
     std::vector<uint8_t> dop_scratch;
 
     auto fsst_build = [&] { return BuildFsstPayload(c); };
@@ -770,6 +827,7 @@ int main(int argc, char** argv) {
       return DecodeOnPairPayload(p, s, o);
     };
     auto dop_build = [&] { return BuildDictOnPairPayload(c, cfg16); };
+    auto dop_auto_build = [&] { return BuildDictOnPairPayload(c, cfg_dop); };
     auto dop_decode = [&](const uint8_t* p, size_t /*s*/, uint8_t* o) {
       return DecodeDictOnPairPayload(p, o, &dop_scratch);
     };
@@ -785,10 +843,17 @@ int main(int argc, char** argv) {
                               return DecodePqPayload(c, e, p, s, o);
                             }));
     };
-    auto dict_build = [&] { return BuildDictPayload(c, vals, descr.get()); };
-    auto dict_decode = [&](const uint8_t* p, size_t s, uint8_t* o) {
-      return DecodeDictPayload(c, descr.get(), p, s, o);
+    auto dict_of = [&](parquet::Encoding::type dpe) {
+      return std::make_pair(
+          BuildFn([&, dpe] { return BuildDictPayload(c, vals, descr.get(), dpe); }),
+          DecodeFn([&](const uint8_t* p, size_t s, uint8_t* o) {
+            return DecodeDictPayload(c, descr.get(), p, s, o);
+          }));
     };
+    auto dict_plain = dict_of(parquet::Encoding::PLAIN);
+    auto dict_dlba = dict_of(parquet::Encoding::DELTA_LENGTH_BYTE_ARRAY);
+    const BuildFn& dict_build = dict_plain.first;
+    const DecodeFn& dict_decode = dict_plain.second;
 
     std::vector<Measured> ms;
     // Reference points, measured here so every ratio in this table shares one
@@ -809,6 +874,7 @@ int main(int argc, char** argv) {
     ms.push_back(RunCodec(c, "OnPair-auto", Generic::kNone, op_build, op_decode));
     ms.push_back(RunCodec(c, "OnPair16", Generic::kNone, op16_build, op_decode));
     ms.push_back(RunCodec(c, "DICT+OnPair", Generic::kNone, dop_build, dop_decode));
+    ms.push_back(RunCodec(c, "DICT+OnPair-auto", Generic::kNone, dop_auto_build, dop_decode));
 
     // Group A: cascade a generic codec over FSST / OnPair.
     ms.push_back(RunCodec(c, "FSST+zstd(1)", Generic::kZstd1, fsst_build, fsst_decode));
@@ -837,6 +903,16 @@ int main(int argc, char** argv) {
     for (Generic g : {Generic::kNone, Generic::kZstd1, Generic::kLz4}) {
       ms.push_back(RunCodec(c, "RLE_DICTIONARY" + std::string(GenericSuffix(g)), g, dict_build,
                             dict_decode));
+    }
+    // A dictionary page carrying DELTA_LENGTH_BYTE_ARRAY instead of PLAIN. Not a
+    // page any writer can emit -- the spec fixes BYTE_ARRAY dictionary pages at
+    // PLAIN -- so these two rows measure a format change, and are the opponent
+    // DICT+OnPair deserves: both replace the dictionary page's encoding and leave
+    // the index stream alone. Encode throughput here is pessimistic; see
+    // BuildDictPayload.
+    for (Generic g : {Generic::kNone, Generic::kZstd1}) {
+      ms.push_back(RunCodec(c, "DICT+DLBA" + std::string(GenericSuffix(g)), g, dict_dlba.first,
+                            dict_dlba.second));
     }
 
     std::printf("%-30s %10zu %10.2f\n", c.name.c_str(), c.n_rows(), Mib(c.raw_bytes()));
