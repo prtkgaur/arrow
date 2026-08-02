@@ -139,10 +139,18 @@ struct Column {
   }
 };
 
+/// Wall-clock seconds spent in each phase of Compress. The three sum to the
+/// whole call. Only for attributing encode cost; pass null in a timed run.
+struct EncodeProfile {
+  double train_s = 0;     ///< greedy pairing pass over the shuffled sample
+  double rebuild_s = 0;   ///< sort the dictionary, rebuild the matcher over it
+  double tokenize_s = 0;  ///< tokenize every row against the frozen dictionary
+};
+
 /// Train a dictionary against (bytes, offsets) and greedily tokenize every row.
 /// `offsets` has length num_rows + 1; row i is bytes[offsets[i]..offsets[i+1]].
 Column Compress(const uint8_t* bytes, size_t bytes_len, const uint32_t* offsets,
-                size_t num_rows, const Config& cfg);
+                size_t num_rows, const Config& cfg, EncodeProfile* profile = nullptr);
 
 /// Exact decoded byte length of the whole column (sum of token lengths).
 size_t DecodedLen(const Column& col);

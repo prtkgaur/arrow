@@ -18,9 +18,9 @@
 #include "parquet/onpair/onpair.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <numeric>
-#include <unordered_map>
 
 namespace parquet::onpair {
 namespace {
@@ -51,6 +51,169 @@ inline size_t MatchingLowBytes(uint64_t x) {
   return x == 0 ? 8 : (static_cast<size_t>(__builtin_ctzll(x)) >> 3);
 }
 
+// Flat u64 -> u32 hash table
+//
+// The tokenizer probes its lookup tables several times per token, so probe cost
+// dominates encode time. std::unordered_map is the wrong shape for that: the
+// bucket array load and the node load are dependent, so every miss costs two
+// serialized cache misses, and at tens of thousands of tokens neither fits in
+// cache. Open addressing with the key and value in one 16-byte slot makes the
+// common case a single load. Insert order still decides which of two equal keys
+// wins, so swapping this in cannot change the tokenization.
+
+constexpr uint32_t kFlatEmpty = ~uint32_t{0};
+
+inline uint64_t MixU64(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+class FlatU64Map {
+ public:
+  FlatU64Map() : slots_(kMinSlots), mask_(kMinSlots - 1) {}
+
+  bool empty() const { return size_ == 0; }
+
+  /// Value for `key`, or kFlatEmpty when absent.
+  uint32_t Find(uint64_t key) const {
+    size_t i = MixU64(key) & mask_;
+    for (;;) {
+      const Slot& s = slots_[i];
+      if (s.val == kFlatEmpty) return kFlatEmpty;
+      if (s.key == key) return s.val;
+      i = (i + 1) & mask_;
+    }
+  }
+
+  /// Insert `key`, or overwrite the value already stored under it.
+  void Put(uint64_t key, uint32_t val) {
+    size_t i = MixU64(key) & mask_;
+    for (;;) {
+      Slot& s = slots_[i];
+      if (s.val == kFlatEmpty) {
+        s.key = key;
+        s.val = val;
+        ++size_;
+        // Linear probing degrades sharply past half full; grow well before then.
+        if (size_ * 2 > slots_.size()) Grow();
+        return;
+      }
+      if (s.key == key) {
+        s.val = val;
+        return;
+      }
+      i = (i + 1) & mask_;
+    }
+  }
+
+ private:
+  struct Slot {
+    uint64_t key = 0;
+    uint32_t val = kFlatEmpty;
+  };
+  static constexpr size_t kMinSlots = 64;
+
+  void Grow() {
+    std::vector<Slot> old(slots_.size() * 2);
+    old.swap(slots_);
+    mask_ = slots_.size() - 1;
+    for (const Slot& s : old) {
+      if (s.val == kFlatEmpty) continue;
+      size_t i = MixU64(s.key) & mask_;
+      while (slots_[i].val != kFlatEmpty) i = (i + 1) & mask_;
+      slots_[i] = s;
+    }
+  }
+
+  std::vector<Slot> slots_;
+  size_t mask_;
+  size_t size_ = 0;
+};
+
+// Flat pair-frequency counter for the training loop
+//
+// The trainer touches this once per token boundary, so it sits on the same hot
+// path as the matcher and wants the same treatment. Deleting a promoted pair is a
+// reset to zero rather than a real erase: a caller cannot tell an absent key from
+// a zero count, so the two are equivalent, and it keeps linear probing free of
+// tombstones (promotions are also rare - at most one per dictionary entry).
+
+inline uint32_t MixU32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+class FlatFreqMap {
+ public:
+  FlatFreqMap() : slots_(kMinSlots), mask_(kMinSlots - 1) {}
+
+  /// Saturating increment of `key`'s count (absent == 0), returning the new value.
+  uint8_t Bump(uint32_t key) {
+    size_t i = MixU32(key) & mask_;
+    for (;;) {
+      Slot& s = slots_[i];
+      if (s.count == kEmptyCount) {
+        s.key = key;
+        s.count = 1;
+        ++size_;
+        if (size_ * 2 > slots_.size()) Grow();
+        return 1;
+      }
+      if (s.key == key) {
+        if (s.count < 255) ++s.count;
+        return static_cast<uint8_t>(s.count);
+      }
+      i = (i + 1) & mask_;
+    }
+  }
+
+  /// Forget `key`'s count. Precondition: Bump(key) was called at least once.
+  void Reset(uint32_t key) {
+    size_t i = MixU32(key) & mask_;
+    for (;;) {
+      Slot& s = slots_[i];
+      if (s.count == kEmptyCount) return;
+      if (s.key == key) {
+        s.count = 0;
+        return;
+      }
+      i = (i + 1) & mask_;
+    }
+  }
+
+ private:
+  struct Slot {
+    uint32_t key = 0;
+    uint16_t count = kEmptyCount;
+  };
+  static constexpr uint16_t kEmptyCount = 0xFFFF;
+  static constexpr size_t kMinSlots = 1024;
+
+  void Grow() {
+    std::vector<Slot> old(slots_.size() * 2);
+    old.swap(slots_);
+    mask_ = slots_.size() - 1;
+    for (const Slot& s : old) {
+      if (s.count == kEmptyCount) continue;
+      size_t i = MixU32(s.key) & mask_;
+      while (slots_[i].count != kEmptyCount) i = (i + 1) & mask_;
+      slots_[i] = s;
+    }
+  }
+
+  std::vector<Slot> slots_;
+  size_t mask_;
+  size_t size_ = 0;
+};
+
 // Longest-prefix matcher
 // Two-tier index per the paper (sec 3.4.1): a hash map for tokens <=8 bytes, and
 // 8-byte-prefix buckets (suffixes sorted descending) for 9..16-byte tokens.
@@ -58,8 +221,24 @@ inline size_t MatchingLowBytes(uint64_t x) {
 // suffixes (sec 3.4.4, dropping extras); this port instead promotes an over-full
 // bucket to a trie (PROMOTE_THRESHOLD), keeping all suffixes. Also, the paper's
 // static parsing phase (sec 3.4.3) finalizes long-pattern lookup with a minimal
-// perfect hash; this port keeps std::unordered_map (the paper notes the
+// perfect hash; this port keeps an ordinary hash table (the paper notes the
 // perfect-hash path is Rust-only). Encode-time behavior only.
+
+// Prefix filter
+//
+// One byte per possible two-byte prefix of the data: bit (len-1) is set when some
+// token of exactly `len` bytes (2..kBucketPrefixLen) starts with those two bytes,
+// and bit 0 when some token longer than kBucketPrefixLen does. Length 1 is left
+// out, since a single-byte match always exists and is probed anyway. Packing the
+// eight live bits into a byte rather than a u16 halves the table to 64 KB.
+//
+// Folding the prefix into fewer slots would stay correct - the filter only ever
+// SKIPS work, so a collision costs a wasted probe and can never change the answer
+// - but measurably loses: at 16 KB and below the index arithmetic costs more than
+// the smaller footprint saves, because the live prefix set is already small.
+
+constexpr size_t kPrefixSlots = size_t{1} << 16;
+constexpr uint8_t kMaskLongBit = 1;
 
 struct LongEntry {
   uint64_t suffix;
@@ -83,10 +262,8 @@ class LongestPrefixMatcher {
   static LongestPrefixMatcher New() {
     LongestPrefixMatcher m;
     for (uint16_t i = 0; i <= 255; ++i) {
-      uint8_t b = static_cast<uint8_t>(i);
-      m.short_by_len_[1][static_cast<uint64_t>(b)] = i;
+      m.short_by_len_[1].Put(static_cast<uint64_t>(static_cast<uint8_t>(i)), i);
     }
-    m.max_short_len_ = 1;
     m.next_id_ = 256;
     return m;
   }
@@ -117,12 +294,16 @@ class LongestPrefixMatcher {
     size_t max_len = std::min(data_len, kMaxTokenSize);
     uint64_t low64 = LoadLeU64(data, data_len, std::min(max_len, kBucketPrefixLen));
 
-    if (max_len > kBucketPrefixLen && !long_map_.empty()) {
-      auto it = long_map_.find(low64);
-      if (it != long_map_.end()) {
+    // Every token of 2 bytes or more shares its first two bytes with the data, so
+    // one array read rules out the lengths at which no token can possibly match.
+    uint32_t present = max_len >= 2 ? prefix_mask_[low64 & 0xFFFF] : 0;
+
+    if (max_len > kBucketPrefixLen && (present & kMaskLongBit) != 0) {
+      uint32_t bucket = long_map_.Find(low64);
+      if (bucket != kFlatEmpty) {
         const uint8_t* suf = data + kBucketPrefixLen;
         size_t suf_len = max_len - kBucketPrefixLen;
-        const Bucket& b = it->second;
+        const Bucket& b = buckets_[bucket];
         std::pair<Token, size_t> hit{0, 0};
         bool found;
         if (b.trie_root < 0) {
@@ -136,43 +317,67 @@ class LongestPrefixMatcher {
       }
     }
 
-    size_t short_max = std::min(max_len, static_cast<size_t>(max_short_len_));
-    for (size_t len = short_max; len >= 1; --len) {
-      uint64_t key = low64 & MaskU64(len);
-      const auto& map = short_by_len_[len];
-      auto it = map.find(key);
-      if (it != map.end()) {
-        return {it->second, len};
+    // Descend only through the occupied lengths. Bit (len-1) holds length `len`,
+    // so clearing bit 0 also drops the long-token bit.
+    size_t short_max = std::min(max_len, kBucketPrefixLen);
+    uint32_t cand = present & (((uint32_t{1} << short_max) - 1) & ~uint32_t{1});
+    while (cand != 0) {
+      size_t len = 32 - static_cast<size_t>(__builtin_clz(cand));
+      cand &= ~(uint32_t{1} << (len - 1));
+      uint32_t tok = short_by_len_[len].Find(low64 & MaskU64(len));
+      if (tok != kFlatEmpty) {
+        return {static_cast<Token>(tok), len};
       }
     }
-    // Precondition: every single-byte token is present, so len==1 always hits.
+    uint32_t one = short_by_len_[1].Find(low64 & 0xFF);
+    if (one != kFlatEmpty) return {static_cast<Token>(one), 1};
+    // Precondition: every single-byte token is present, so the probe above hits.
     return {static_cast<Token>(data[0]), 1};
   }
 
  private:
   // short_by_len_[len] maps the low-`len`-byte packed key to a token, for len 1..8.
-  std::unordered_map<uint64_t, Token> short_by_len_[kBucketPrefixLen + 1];
-  std::unordered_map<uint64_t, Bucket> long_map_;
+  FlatU64Map short_by_len_[kBucketPrefixLen + 1];
+  FlatU64Map long_map_;  // 8-byte prefix -> index into buckets_
+  std::vector<Bucket> buckets_;
   std::vector<TrieNode> pool_;
-  uint8_t max_short_len_ = 1;
+  std::vector<uint8_t> prefix_mask_ = std::vector<uint8_t>(kPrefixSlots, 0);
   uint32_t next_id_ = 0;
 
   void InsertInternal(const uint8_t* data, size_t len, Token id) {
+    if (len >= 2) {
+      uint32_t p = static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8);
+      uint32_t bit = len <= kBucketPrefixLen ? (uint32_t{1} << (len - 1)) : kMaskLongBit;
+      prefix_mask_[p] |= static_cast<uint8_t>(bit);
+    }
     if (len <= kBucketPrefixLen) {
       uint64_t key = LoadLeU64(data, len, len);
-      short_by_len_[len][key] = id;
-      max_short_len_ = std::max<uint8_t>(max_short_len_, static_cast<uint8_t>(len));
+      short_by_len_[len].Put(key, id);
       return;
     }
     uint64_t prefix = LoadLeU64(data, len, kBucketPrefixLen);
     size_t slen = len - kBucketPrefixLen;
     uint64_t suffix = LoadLeU64(data + kBucketPrefixLen, slen, slen);
-    Bucket& b = long_map_[prefix];
+    uint32_t bi = long_map_.Find(prefix);
+    if (bi == kFlatEmpty) {
+      bi = static_cast<uint32_t>(buckets_.size());
+      buckets_.emplace_back();
+      long_map_.Put(prefix, bi);
+    }
+    Bucket& b = buckets_[bi];
     if (b.trie_root < 0) {
-      b.entries.push_back(LongEntry{suffix, static_cast<uint8_t>(slen), id});
-      // Keep descending-by-length order so the first linear match is longest.
-      std::sort(b.entries.begin(), b.entries.end(),
-                [](const LongEntry& a, const LongEntry& c) { return a.slen > c.slen; });
+      // Keep descending-by-length order so the first linear match is longest. The
+      // bucket is already ordered, so place the new entry rather than re-sorting
+      // the whole thing on every insert - this runs inside the training loop.
+      // Two entries can only share a length if they also share a suffix, i.e. if
+      // the same token bytes were inserted twice, so where equal lengths land
+      // relative to each other is not observable.
+      LongEntry e{suffix, static_cast<uint8_t>(slen), id};
+      auto by_len_desc = [](const LongEntry& a, const LongEntry& c) {
+        return a.slen > c.slen;
+      };
+      auto at = std::upper_bound(b.entries.begin(), b.entries.end(), e, by_len_desc);
+      b.entries.insert(at, e);
       if (b.entries.size() > kPromoteThreshold) {
         BuildTrie(&b);
       }
@@ -369,7 +574,10 @@ struct TrainResult {
   LongestPrefixMatcher lpm;
 };
 
-TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const Config& cfg) {
+TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n,
+                  const Config& cfg, EncodeProfile* profile) {
+  using Clock = std::chrono::steady_clock;
+  auto t0 = Clock::now();
   size_t dict_capacity = size_t{1} << cfg.max_dict_bits;
 
   std::vector<uint8_t> dict_bytes;
@@ -401,7 +609,7 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
   // rows and removes any doubt.)
   PartialShuffle(&order, n, cfg.seed);
 
-  std::unordered_map<uint32_t, uint8_t> freq;
+  FlatFreqMap freq;
 
   bool full_dictionary = false;
   bool budget_exhausted = false;
@@ -436,9 +644,8 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
       size_t pair_len = prev_len + curr_len;
       if (pair_len <= kMaxTokenSize) {
         uint32_t key = (static_cast<uint32_t>(prev_id) << 16) | static_cast<uint32_t>(curr_id);
-        uint8_t& slot = freq[key];
-        if (slot < 255) ++slot;  // saturating
-        if (slot >= threshold) {
+        uint8_t count = freq.Bump(key);
+        if (count >= threshold) {
           size_t pair_start = pos - prev_len;
           Token new_id = lpm.Insert(str + pair_start, pair_len);
           dict_bytes.insert(dict_bytes.end(), str + pair_start, str + pos + curr_len);
@@ -451,7 +658,7 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
           ctrl.on_entry_created();
           threshold = ctrl.get();
 
-          freq.erase(key);
+          freq.Reset(key);
           prev_id = new_id;
           prev_len = pair_len;
           pos += curr_len;
@@ -466,6 +673,7 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
 
   std::vector<uint8_t> sorted_bytes;
   std::vector<uint32_t> sorted_offsets;
+  auto t1 = Clock::now();
   SortTokens(dict_bytes, dict_offsets, &sorted_bytes, &sorted_offsets);
   PadRaw(&sorted_bytes, sorted_offsets);
 
@@ -474,6 +682,10 @@ TrainResult Train(const uint8_t* data, const uint32_t* offsets, size_t n, const 
   dict.offsets = std::move(sorted_offsets);
   dict.RecomputeMaxTokenLen();
   LongestPrefixMatcher final_lpm = LongestPrefixMatcher::FromDictionary(dict);
+  if (profile != nullptr) {
+    profile->train_s = std::chrono::duration<double>(t1 - t0).count();
+    profile->rebuild_s = std::chrono::duration<double>(Clock::now() - t1).count();
+  }
   return TrainResult{std::move(dict), std::move(final_lpm)};
 }
 
@@ -501,13 +713,18 @@ void EncodeStrings(const uint8_t* data, const uint32_t* offsets, size_t n,
 // Public API
 
 Column Compress(const uint8_t* bytes, size_t /*bytes_len*/, const uint32_t* offsets,
-                size_t num_rows, const Config& cfg) {
-  TrainResult tr = Train(bytes, offsets, num_rows, cfg);
+                size_t num_rows, const Config& cfg, EncodeProfile* profile) {
+  TrainResult tr = Train(bytes, offsets, num_rows, cfg, profile);
   Column col;
   col.dict = std::move(tr.dict);
   col.codes.reserve(num_rows == 0 ? 0 : offsets[num_rows]);
   col.row_offsets.reserve(num_rows + 1);
+  auto t0 = std::chrono::steady_clock::now();
   EncodeStrings(bytes, offsets, num_rows, tr.lpm, &col.codes, &col.row_offsets);
+  if (profile != nullptr) {
+    profile->tokenize_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
   return col;
 }
 
