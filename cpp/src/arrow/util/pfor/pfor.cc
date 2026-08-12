@@ -286,21 +286,27 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
           info.bit_width(),
           reinterpret_cast<const uint32_t*>(read_ptr), scratch);
 
+      // The FOR-add loops below use static_cast rather than util::SafeCopy, and
+      // restate non-aliasing with __restrict__, for the same reason as the
+      // BitPack path further down: SafeCopy blocks vectorization. Only the two
+      // sequential loops can actually vectorize; the flat path's gather cannot,
+      // but there is no reason for it to carry SafeCopy either.
+      const uint32_t* __restrict__ fl_in = scratch;
+      T* __restrict__ fl_out = values;
+
       if (mode == PackingMode::FastLanesOrdered) {
         // No FL_ORDER reorder was applied at encode: scratch[i] is already the
         // delta for original position i. Sequential read + sequential write,
         // flat (in-order) output at full unpack speed — no gather either side.
         for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
-          values[i] = util::SafeCopy<T>(
-              static_cast<UnsignedT>(scratch[i]) + unsigned_for);
+          fl_out[i] = static_cast<T>(static_cast<UnsignedT>(fl_in[i]) + unsigned_for);
         }
       } else if (emit_transposed) {
         // FastLanes, transposed output: write `values[t] = scratch[t] + FOR`
         // sequentially. Output is in FastLanes stream order, i.e. values[t]
         // corresponds to the original input at fromTransposed32(t).
         for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
-          values[t] = util::SafeCopy<T>(
-              static_cast<UnsignedT>(scratch[t]) + unsigned_for);
+          fl_out[t] = static_cast<T>(static_cast<UnsignedT>(fl_in[t]) + unsigned_for);
         }
       } else {
         // FastLanes, flat output: fused FL_ORDER inverse + FOR-add. The gather
@@ -308,8 +314,8 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
         // gather is what FastLanesOrdered avoids.
         for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
           const UnsignedT v =
-              static_cast<UnsignedT>(scratch[fastlanes::toTransposed32(i)]);
-          values[i] = util::SafeCopy<T>(v + unsigned_for);
+              static_cast<UnsignedT>(fl_in[fastlanes::toTransposed32(i)]);
+          fl_out[i] = static_cast<T>(v + unsigned_for);
         }
       }
     } else if (unsigned_for == 0) {
