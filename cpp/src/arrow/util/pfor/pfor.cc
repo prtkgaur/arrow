@@ -124,12 +124,16 @@ inline void FastLanesPackBlockDispatch(uint8_t bit_width, const uint32_t* in,
   }
 }
 
+// kHasBias folds a frame-of-reference add into the kernel's own store, so the
+// caller does not need a second pass over the output. Defaulted to false so the
+// FL_ORDER gather path, which cannot use it, keeps the cheaper instantiation.
+template <bool kHasBias = false>
 inline void FastLanesUnpackBlockDispatch(uint8_t bit_width, const uint32_t* packed,
-                                          uint32_t* out) {
+                                          uint32_t* out, uint32_t bias = 0) {
   switch (bit_width) {
 #define CASE_W(N) \
   case N:         \
-    fastlanes::UnpackBlock<N>(packed, out); \
+    fastlanes::UnpackBlock<N, kHasBias>(packed, out, bias); \
     break
     CASE_W(1);  CASE_W(2);  CASE_W(3);  CASE_W(4);  CASE_W(5);  CASE_W(6);
     CASE_W(7);  CASE_W(8);  CASE_W(9);  CASE_W(10); CASE_W(11); CASE_W(12);
@@ -285,15 +289,22 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
       // variants; only the flat variant has to gather through toTransposed32.
       const bool sequential_output =
           mode == PackingMode::FastLanesOrdered || emit_transposed;
-      if (sizeof(T) == 4 && unsigned_for == 0 && sequential_output) {
-        // Same elision the bit-packed path does below: with no bias to add and
-        // the output already in unpack order, UnpackBlock can write the values
-        // themselves rather than a scratch buffer a second pass reads back. The
-        // kernel makes no alignment assumption, so an unaligned `values` is
-        // fine. Exceptions are still patched below in Step 4.
-        FastLanesUnpackBlockDispatch(info.bit_width(),
-                                     reinterpret_cast<const uint32_t*>(read_ptr),
-                                     reinterpret_cast<uint32_t*>(values));
+      if (sizeof(T) == 4 && sequential_output) {
+        // Same elision the bit-packed path does below: the output is already in
+        // unpack order, so UnpackBlock can write the values themselves rather
+        // than a scratch buffer a second pass reads back. The add is modular in
+        // UnsignedT, which is the same width as T, so the bits the kernel
+        // stores are already the signed values. The kernel makes no alignment
+        // assumption, so an unaligned `values` is fine. Exceptions are still
+        // patched below in Step 4.
+        auto* const out = reinterpret_cast<uint32_t*>(values);
+        const auto* const in = reinterpret_cast<const uint32_t*>(read_ptr);
+        if (unsigned_for == 0) {
+          FastLanesUnpackBlockDispatch(info.bit_width(), in, out);
+        } else {
+          FastLanesUnpackBlockDispatch</*kHasBias=*/true>(
+              info.bit_width(), in, out, static_cast<uint32_t>(unsigned_for));
+        }
       } else {
         alignas(64) uint32_t scratch[fastlanes::kBlockSize];
         FastLanesUnpackBlockDispatch(
@@ -307,19 +318,15 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
         const uint32_t* __restrict__ fl_in = scratch;
         T* __restrict__ fl_out = values;
 
-        if (mode == PackingMode::FastLanesOrdered) {
-          // No FL_ORDER reorder was applied at encode: scratch[i] is already the
-          // delta for original position i. Sequential read + sequential write,
-          // flat (in-order) output at full unpack speed — no gather either side.
+        if (sequential_output) {
+          // scratch[i] is already the value for output position i: for the
+          // ordered mode because no FL_ORDER reorder was applied at encode, for
+          // the transposed variant because the caller wants FastLanes stream
+          // order (values[t] corresponds to the input at fromTransposed32(t)).
+          // Only a non-4-byte element type reaches here — at 4 bytes the branch
+          // above folds this add into the unpack and skips scratch entirely.
           for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
             fl_out[i] = static_cast<T>(static_cast<UnsignedT>(fl_in[i]) + unsigned_for);
-          }
-        } else if (emit_transposed) {
-          // FastLanes, transposed output: write `values[t] = scratch[t] + FOR`
-          // sequentially. Output is in FastLanes stream order, i.e. values[t]
-          // corresponds to the original input at fromTransposed32(t).
-          for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
-            fl_out[t] = static_cast<T>(static_cast<UnsignedT>(fl_in[t]) + unsigned_for);
           }
         } else {
           // FastLanes, flat output: fused FL_ORDER inverse + FOR-add. The gather

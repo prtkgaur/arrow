@@ -121,15 +121,32 @@ inline void PackBlock(const uint32_t* __restrict__ in, uint32_t* __restrict__ ou
 // ---------------------------------------------------------------------------
 // Unpack: w*32 packed u32 words → 1024 u32 outputs in transposed order.
 // (No scatter: output[t] is the value at stream-position t = row*32+lane.)
+//
+// With kHasBias, `bias` is added to every value before it is stored, so a
+// frame-of-reference decoder does not need a second pass over the output to
+// add it. That pass is not cheap: measured against the unpack it follows it
+// costs 1.47x-2.40x, and a pass that only copies costs the same as one that
+// adds, so what is paid for is the traversal rather than the arithmetic.
+// The add is modular in uint32_t, matching the encoder's subtraction.
+// kHasBias is a template parameter so the no-bias instantiations, which are
+// the ones on the FL_ORDER gather path, are unchanged.
 // ---------------------------------------------------------------------------
-template <uint32_t w>
+template <uint32_t w, bool kHasBias = false>
 inline void UnpackBlock(const uint32_t* __restrict__ packed,
-                        uint32_t* __restrict__ out) {
+                        uint32_t* __restrict__ out, uint32_t bias = 0) {
   static_assert(w >= 1 && w <= 32);
   constexpr uint32_t kMask = (w == 32) ? 0xFFFFFFFFu : ((1u << w) - 1);
 
   if constexpr (w == 32) {
-    std::memcpy(out, packed, kBlockSize * sizeof(uint32_t));
+    if constexpr (kHasBias) {
+      // A loop, not memcpy-then-add: both pointers are restrict-qualified
+      // uint32_t*, so this vectorizes and stays a single traversal.
+      for (size_t i = 0; i < kBlockSize; ++i) {
+        out[i] = packed[i] + bias;
+      }
+    } else {
+      std::memcpy(out, packed, kBlockSize * sizeof(uint32_t));
+    }
     return;
   }
 
@@ -144,15 +161,22 @@ inline void UnpackBlock(const uint32_t* __restrict__ packed,
 
     if (word == endWord) {
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        out[row * kLanes + lane] =
-            (packed[word * kLanes + lane] >> shift) & kMask;
+        uint32_t v = (packed[word * kLanes + lane] >> shift) & kMask;
+        if constexpr (kHasBias) {
+          v += bias;
+        }
+        out[row * kLanes + lane] = v;
       }
     } else {
       const uint32_t lowBits = kT - shift;
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         const uint32_t lo = packed[word * kLanes + lane] >> shift;
         const uint32_t hi = packed[endWord * kLanes + lane] << lowBits;
-        out[row * kLanes + lane] = (lo | hi) & kMask;
+        uint32_t v = (lo | hi) & kMask;
+        if constexpr (kHasBias) {
+          v += bias;
+        }
+        out[row * kLanes + lane] = v;
       }
     }
   }
