@@ -220,19 +220,32 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
       // difference is value placement: FastLanes applies the FL_ORDER reorder
       // (gather deltas[fromTransposed32(t)]); FastLanesOrdered keeps original
       // order (no gather), so decode returns flat output with no inverse gather.
-      alignas(64) uint32_t block[fastlanes::kBlockSize];
-      if (effective_mode == PackingMode::FastLanes) {
-        for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
-          block[t] = static_cast<uint32_t>(deltas[fastlanes::fromTransposed32(t)]);
-        }
+      auto* const packed =
+          reinterpret_cast<uint32_t*>(result.mutable_packed_values().data());
+      // FastLanesOrdered's copy into `block` was the identity when the deltas
+      // are already 32-bit: pack straight out of `deltas` instead. FastLanes
+      // still needs the staging buffer because its gather cannot be done in
+      // place.
+      const bool pack_deltas_directly =
+          sizeof(UnsignedT) == 4 && effective_mode == PackingMode::FastLanesOrdered;
+      if (pack_deltas_directly) {
+        FastLanesPackBlockDispatch(
+            bit_width, reinterpret_cast<const uint32_t*>(deltas), packed);
       } else {
-        for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
-          block[i] = static_cast<uint32_t>(deltas[i]);
+        alignas(64) uint32_t block[fastlanes::kBlockSize];
+        if (effective_mode == PackingMode::FastLanes) {
+          for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
+            block[t] = static_cast<uint32_t>(deltas[fastlanes::fromTransposed32(t)]);
+          }
+        } else {
+          // Ordered, but the direct path was declined on element width. Keep the
+          // original-order copy rather than falling through to the gather.
+          for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
+            block[i] = static_cast<uint32_t>(deltas[i]);
+          }
         }
+        FastLanesPackBlockDispatch(bit_width, block, packed);
       }
-      FastLanesPackBlockDispatch(
-          bit_width, block,
-          reinterpret_cast<uint32_t*>(result.mutable_packed_values().data()));
     } else {
       bit_util::BitWriter writer(result.mutable_packed_values().data(),
                                  static_cast<int>(packed_size));
@@ -278,44 +291,59 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
     const PackingMode mode = info.packing_mode();
     if (mode == PackingMode::FastLanes || mode == PackingMode::FastLanesOrdered) {
       // FastLanes-packed payload: 128 * bit_width bytes per 1024-block.
-      // Unpack into lane-interleaved scratch.
       ARROW_DCHECK(num_elements ==
                    static_cast<int32_t>(fastlanes::kBlockSize));
-      alignas(64) uint32_t scratch[fastlanes::kBlockSize];
-      FastLanesUnpackBlockDispatch(
-          info.bit_width(),
-          reinterpret_cast<const uint32_t*>(read_ptr), scratch);
 
-      // The FOR-add loops below use static_cast rather than util::SafeCopy, and
-      // restate non-aliasing with __restrict__, for the same reason as the
-      // BitPack path further down: SafeCopy blocks vectorization. Only the two
-      // sequential loops can actually vectorize; the flat path's gather cannot,
-      // but there is no reason for it to carry SafeCopy either.
-      const uint32_t* __restrict__ fl_in = scratch;
-      T* __restrict__ fl_out = values;
-
-      if (mode == PackingMode::FastLanesOrdered) {
-        // No FL_ORDER reorder was applied at encode: scratch[i] is already the
-        // delta for original position i. Sequential read + sequential write,
-        // flat (in-order) output at full unpack speed — no gather either side.
-        for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
-          fl_out[i] = static_cast<T>(static_cast<UnsignedT>(fl_in[i]) + unsigned_for);
-        }
-      } else if (emit_transposed) {
-        // FastLanes, transposed output: write `values[t] = scratch[t] + FOR`
-        // sequentially. Output is in FastLanes stream order, i.e. values[t]
-        // corresponds to the original input at fromTransposed32(t).
-        for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
-          fl_out[t] = static_cast<T>(static_cast<UnsignedT>(fl_in[t]) + unsigned_for);
-        }
+      // Output is in unpack order for both the ordered and the transposed
+      // variants; only the flat variant has to gather through toTransposed32.
+      const bool sequential_output =
+          mode == PackingMode::FastLanesOrdered || emit_transposed;
+      if (sizeof(T) == 4 && unsigned_for == 0 && sequential_output) {
+        // Same elision the bit-packed path does below: with no bias to add and
+        // the output already in unpack order, UnpackBlock can write the values
+        // themselves rather than a scratch buffer a second pass reads back. The
+        // kernel makes no alignment assumption, so an unaligned `values` is
+        // fine. Exceptions are still patched below in Step 4.
+        FastLanesUnpackBlockDispatch(info.bit_width(),
+                                     reinterpret_cast<const uint32_t*>(read_ptr),
+                                     reinterpret_cast<uint32_t*>(values));
       } else {
-        // FastLanes, flat output: fused FL_ORDER inverse + FOR-add. The gather
-        // index is toTransposed32(i) (inverse of the encode-side gather). This
-        // gather is what FastLanesOrdered avoids.
-        for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
-          const UnsignedT v =
-              static_cast<UnsignedT>(fl_in[fastlanes::toTransposed32(i)]);
-          fl_out[i] = static_cast<T>(v + unsigned_for);
+        alignas(64) uint32_t scratch[fastlanes::kBlockSize];
+        FastLanesUnpackBlockDispatch(
+            info.bit_width(),
+            reinterpret_cast<const uint32_t*>(read_ptr), scratch);
+
+        // The FOR-add loops below use static_cast rather than util::SafeCopy,
+        // and restate non-aliasing with __restrict__, for the same reason as the
+        // BitPack path further down: SafeCopy blocks vectorization. Only the two
+        // sequential loops can actually vectorize; the flat path's gather
+        // cannot, but there is no reason for it to carry SafeCopy either.
+        const uint32_t* __restrict__ fl_in = scratch;
+        T* __restrict__ fl_out = values;
+
+        if (mode == PackingMode::FastLanesOrdered) {
+          // No FL_ORDER reorder was applied at encode: scratch[i] is already the
+          // delta for original position i. Sequential read + sequential write,
+          // flat (in-order) output at full unpack speed — no gather either side.
+          for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
+            fl_out[i] = static_cast<T>(static_cast<UnsignedT>(fl_in[i]) + unsigned_for);
+          }
+        } else if (emit_transposed) {
+          // FastLanes, transposed output: write `values[t] = scratch[t] + FOR`
+          // sequentially. Output is in FastLanes stream order, i.e. values[t]
+          // corresponds to the original input at fromTransposed32(t).
+          for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
+            fl_out[t] = static_cast<T>(static_cast<UnsignedT>(fl_in[t]) + unsigned_for);
+          }
+        } else {
+          // FastLanes, flat output: fused FL_ORDER inverse + FOR-add. The gather
+          // index is toTransposed32(i) (inverse of the encode-side gather). This
+          // gather is what FastLanesOrdered avoids.
+          for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
+            const UnsignedT v =
+                static_cast<UnsignedT>(fl_in[fastlanes::toTransposed32(i)]);
+            fl_out[i] = static_cast<T>(v + unsigned_for);
+          }
         }
       }
     } else if (unsigned_for == 0) {
@@ -330,44 +358,23 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
           arrow::internal::UnpackOptions{static_cast<int>(num_elements),
                                          info.bit_width()});
     } else {
-      // Unpack into a scratch buffer that does NOT alias `values`, then add
-      // FOR. Unpacking in place (aliasing the output as the unsigned scratch)
-      // stops the compiler from vectorizing the FOR-add loop — it can't prove
-      // values[] and (UnsignedT*)values[] don't overlap, even with ivdep — and
-      // the loop collapses to scalar (measured ~100x slower). Keep them
-      // separate; use the stack for the common (<=vector-size) case so there
-      // is still no per-vector heap allocation.
-      constexpr int32_t kStackScratch =
-          static_cast<int32_t>(PforConstants::kPforVectorSize);
-      UnsignedT stack_scratch[kStackScratch];
-      std::vector<UnsignedT> heap_scratch;
-      UnsignedT* scratch = stack_scratch;
-      if (num_elements > kStackScratch) {
-        heap_scratch.resize(num_elements);
-        scratch = heap_scratch.data();
-      }
-      // Arrow's unpack handles arbitrary sizes: SIMD for complete batches,
-      // then unpack_exact for the remainder.
-      arrow::internal::unpack(
-          read_ptr, scratch,
+      // FOR is non-zero: hand it to the unpacker as a bias, so the add happens
+      // inside the kernel before its store and the output is traversed once.
+      // The obvious alternative — unpack, then a second pass adding FOR — is
+      // what this code used to do, and that pass measured 1.47x-2.40x the cost
+      // of the unpack it followed (median 1.68x). A pass that only copies costs
+      // the same as one that adds, so what is paid for is the extra traversal,
+      // not the arithmetic; keeping the scratch buffer small enough to stay in
+      // L1 (it was 4 KB on the stack) did not avoid it.
+      //
+      // The add is modular in UnsignedT, so the bits the unpacker stores ARE the
+      // signed values, exactly as in the FOR==0 case above — no cast pass, no
+      // scratch, and no aliasing question. Exceptions are patched in Step 4.
+      arrow::internal::unpack_bias(
+          read_ptr, reinterpret_cast<UnsignedT*>(values),
           arrow::internal::UnpackOptions{static_cast<int>(num_elements),
-                                         info.bit_width()});
-
-      // Add the frame-of-reference back and reinterpret unsigned->signed.
-      // This loop MUST vectorize or it dominates decode (perf showed the bias
-      // add, not the unpack, taking ~65% at ~4 GB/s). Two things are needed:
-      //   1. static_cast, NOT util::SafeCopy: SafeCopy builds an AlignedStorage
-      //      + memcpy + destroy per element, which the vectorizer won't touch.
-      //      The unsigned->signed cast is well-defined (C++20, modular) and
-      //      gives the identical bit pattern, so it is a drop-in replacement.
-      //   2. __restrict__: scratch's address escaped to unpack() above, so
-      //      restate that scratch and values don't alias.
-      // With both, the loop vectorizes and decode runs ~4x faster (~4 -> ~17 GB/s).
-      const UnsignedT* __restrict__ in = scratch;
-      T* __restrict__ out = values;
-      for (int32_t i = 0; i < num_elements; ++i) {
-        out[i] = static_cast<T>(in[i] + unsigned_for);
-      }
+                                         info.bit_width()},
+          unsigned_for);
     }
 
     int64_t packed_size =
