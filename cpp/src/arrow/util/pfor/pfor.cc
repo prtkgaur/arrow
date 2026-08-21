@@ -229,8 +229,8 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
       const bool pack_deltas_directly =
           sizeof(UnsignedT) == 4 && effective_mode == PackingMode::FastLanesOrdered;
       if (pack_deltas_directly) {
-        FastLanesPackBlockDispatch(
-            bit_width, reinterpret_cast<const uint32_t*>(deltas), packed);
+        FastLanesPackBlockDispatch(bit_width, reinterpret_cast<const uint32_t*>(deltas),
+                                   packed);
       } else {
         alignas(64) uint32_t block[fastlanes::kBlockSize];
         if (effective_mode == PackingMode::FastLanes) {
@@ -310,8 +310,7 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
       } else {
         alignas(64) uint32_t scratch[fastlanes::kBlockSize];
         FastLanesUnpackBlockDispatch(
-            info.bit_width(),
-            reinterpret_cast<const uint32_t*>(read_ptr), scratch);
+            info.bit_width(), reinterpret_cast<const uint32_t*>(read_ptr), scratch);
 
         // The FOR-add loops below use static_cast rather than util::SafeCopy,
         // and restate non-aliasing with __restrict__, for the same reason as the
@@ -370,11 +369,10 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
       // The add is modular in UnsignedT, so the bits the unpacker stores ARE the
       // signed values, exactly as in the FOR==0 case above — no cast pass, no
       // scratch, and no aliasing question. Exceptions are patched in Step 4.
-      arrow::internal::unpack_bias(
-          read_ptr, reinterpret_cast<UnsignedT*>(values),
-          arrow::internal::UnpackOptions{static_cast<int>(num_elements),
-                                         info.bit_width()},
-          unsigned_for);
+      arrow::internal::unpack_bias(read_ptr, reinterpret_cast<UnsignedT*>(values),
+                                   arrow::internal::UnpackOptions{
+                                       static_cast<int>(num_elements), info.bit_width()},
+                                   unsigned_for);
     }
 
     int64_t packed_size =
