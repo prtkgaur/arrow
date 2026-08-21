@@ -220,32 +220,19 @@ PforEncodedVector<T> PforCompression<T>::EncodeVector(const T* values,
       // difference is value placement: FastLanes applies the FL_ORDER reorder
       // (gather deltas[fromTransposed32(t)]); FastLanesOrdered keeps original
       // order (no gather), so decode returns flat output with no inverse gather.
-      auto* const packed =
-          reinterpret_cast<uint32_t*>(result.mutable_packed_values().data());
-      // FastLanesOrdered's copy into `block` was the identity when the deltas
-      // are already 32-bit: pack straight out of `deltas` instead. FastLanes
-      // still needs the staging buffer because its gather cannot be done in
-      // place.
-      const bool pack_deltas_directly =
-          sizeof(UnsignedT) == 4 && effective_mode == PackingMode::FastLanesOrdered;
-      if (pack_deltas_directly) {
-        FastLanesPackBlockDispatch(bit_width, reinterpret_cast<const uint32_t*>(deltas),
-                                   packed);
-      } else {
-        alignas(64) uint32_t block[fastlanes::kBlockSize];
-        if (effective_mode == PackingMode::FastLanes) {
-          for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
-            block[t] = static_cast<uint32_t>(deltas[fastlanes::fromTransposed32(t)]);
-          }
-        } else {
-          // Ordered, but the direct path was declined on element width. Keep the
-          // original-order copy rather than falling through to the gather.
-          for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
-            block[i] = static_cast<uint32_t>(deltas[i]);
-          }
+      alignas(64) uint32_t block[fastlanes::kBlockSize];
+      if (effective_mode == PackingMode::FastLanes) {
+        for (size_t t = 0; t < fastlanes::kBlockSize; ++t) {
+          block[t] = static_cast<uint32_t>(deltas[fastlanes::fromTransposed32(t)]);
         }
-        FastLanesPackBlockDispatch(bit_width, block, packed);
+      } else {
+        for (size_t i = 0; i < fastlanes::kBlockSize; ++i) {
+          block[i] = static_cast<uint32_t>(deltas[i]);
+        }
       }
+      FastLanesPackBlockDispatch(
+          bit_width, block,
+          reinterpret_cast<uint32_t*>(result.mutable_packed_values().data()));
     } else {
       bit_util::BitWriter writer(result.mutable_packed_values().data(),
                                  static_cast<int>(packed_size));
