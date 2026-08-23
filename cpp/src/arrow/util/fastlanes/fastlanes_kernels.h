@@ -38,6 +38,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "arrow/util/macros.h"
+
 namespace arrow {
 namespace util {
 namespace fastlanes {
@@ -82,7 +84,7 @@ inline size_t fromTransposed32(size_t t) {
 // fromTransposed32) → w*32 u32 packed words.
 // ---------------------------------------------------------------------------
 template <uint32_t w>
-inline void PackBlock(const uint32_t* __restrict__ in, uint32_t* __restrict__ out) {
+inline void PackBlock(const uint32_t* ARROW_RESTRICT in, uint32_t* ARROW_RESTRICT out) {
   static_assert(w >= 1 && w <= 32);
   constexpr uint32_t kMask = (w == 32) ? 0xFFFFFFFFu : ((1u << w) - 1);
 
@@ -132,8 +134,8 @@ inline void PackBlock(const uint32_t* __restrict__ in, uint32_t* __restrict__ ou
 // the ones on the FL_ORDER gather path, are unchanged.
 // ---------------------------------------------------------------------------
 template <uint32_t w, bool kHasBias = false>
-inline void UnpackBlock(const uint32_t* __restrict__ packed,
-                        uint32_t* __restrict__ out, uint32_t bias = 0) {
+inline void UnpackBlock(const uint32_t* ARROW_RESTRICT packed,
+                        uint32_t* ARROW_RESTRICT out, uint32_t bias = 0) {
   static_assert(w >= 1 && w <= 32);
   constexpr uint32_t kMask = (w == 32) ? 0xFFFFFFFFu : ((1u << w) - 1);
 

@@ -311,12 +311,13 @@ Result<int64_t> PforCompression<T>::DecodeVector(T* values,
             info.bit_width(), reinterpret_cast<const uint32_t*>(read_ptr), scratch);
 
         // The FOR-add loops below use static_cast rather than util::SafeCopy,
-        // and restate non-aliasing with __restrict__, for the same reason as the
-        // BitPack path further down: SafeCopy blocks vectorization. Only the two
-        // sequential loops can actually vectorize; the flat path's gather
-        // cannot, but there is no reason for it to carry SafeCopy either.
-        const uint32_t* __restrict__ fl_in = scratch;
-        T* __restrict__ fl_out = values;
+        // and restate non-aliasing with a restrict qualifier, for the same
+        // reason as the BitPack path further down: SafeCopy blocks
+        // vectorization. Only the two sequential loops can actually vectorize;
+        // the flat path's gather cannot, but there is no reason for it to carry
+        // SafeCopy either.
+        const uint32_t* ARROW_RESTRICT fl_in = scratch;
+        T* ARROW_RESTRICT fl_out = values;
 
         if (sequential_output) {
           // scratch[i] is already the value for output position i: for the
