@@ -27,6 +27,15 @@
 // width. Row r, lane l contributes to packed[r * 32 + l] at bit shift
 // (r*w) % 32, possibly straddling into packed[r * 32 + 32 + l].
 //
+// Bits are assembled exactly as sequential bit-packing assembles them: within
+// one lane, successive rows occupy successive bit positions LSB-first, and a
+// value that runs off the end of a word continues in the low bits of the next.
+// The two layouts differ only in which values land at adjacent bit positions --
+// successive rows of one lane here, successive values of the stream in
+// arrow::internal::unpack -- not in how the bits of a value are laid out. That
+// is why the shift and straddle here depend on the row and never on the lane,
+// and so why all 32 lanes do identical work.
+//
 // FL_ORDER (the 8x16 -> 16x8 within-sub-block transpose plus the
 // 3-bit-reversal sub-block reorder) is applied outside these kernels:
 // callers gather input[fromTransposed32(t)] before packing; the kernel
