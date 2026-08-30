@@ -24,8 +24,9 @@
 //
 // Within a 1024-value block (32 lanes × 32 rows for uint32_t), the
 // packed buffer holds w u32 rows of 32 u32 words, where w is the bit
-// width. Row r, lane l contributes to packed[r * 32 + l] at bit shift
-// (r*w) % 32, possibly straddling into packed[r * 32 + 32 + l].
+// width. Row r, lane l contributes to packed[word * 32 + l] at bit shift
+// (r*w) % 32, where word = (r*w) / 32, possibly straddling into
+// packed[word * 32 + 32 + l]. (word == r only when w == 32.)
 //
 // Bits are assembled exactly as sequential bit-packing assembles them: within
 // one lane, successive rows occupy successive bit positions LSB-first, and a
