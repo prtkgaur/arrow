@@ -311,6 +311,10 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
   // The sum runs in the unsigned type. Signed overflow is undefined, and a
   // column that spans the type's range will overflow -- the encoder took the
   // differences the same way, so the bits round-trip exactly.
+  //
+  // TODO: fold this into the unpack kernel. A scan across lanes with a carry
+  // broadcast would shorten the dependency chain. This applies only to vectors
+  // without exceptions because patching occurs before the prefix sum.
   if (info.is_delta()) {
     auto acc = static_cast<UnsignedT>(start_value);
     for (int32_t i = 0; i < num_elements; ++i) {
