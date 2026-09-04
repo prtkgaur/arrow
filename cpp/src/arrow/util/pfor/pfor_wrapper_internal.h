@@ -54,13 +54,21 @@ class PforWrapper {
   /// \param[in,out] comp_size input: available buffer size, which must be at
   ///                least GetMaxCompressedSize(num_values, vector_size);
   ///                output: bytes written
+  /// \param[in] mode layout for the bit-packed payload, recorded in the page
+  ///            header. A request for PackingMode::kForBitPackInterleaved that
+  ///            this page cannot satisfy -- a 64-bit column, or a vector size
+  ///            other than kPforVectorSize -- is written as
+  ///            PackingMode::kForBitPack instead of refused, so that one
+  ///            writer-level setting can cover a file of mixed column types.
+  ///            Either way the page says which layout it holds.
   /// \return Status::OK on success, or an error if the arguments are invalid
   static Status Encode(const T* values, int32_t num_values, int32_t vector_size,
-                       uint8_t* comp, int64_t* comp_size);
+                       uint8_t* comp, int64_t* comp_size,
+                       PackingMode mode = PackingMode::kForBitPack);
 
   /// Convenience overload with default vector_size = kPforVectorSize
   static Status Encode(const T* values, int32_t num_values, uint8_t* comp,
-                       int64_t* comp_size);
+                       int64_t* comp_size, PackingMode mode = PackingMode::kForBitPack);
 
   /// \brief Decode a PFOR-compressed page
   ///
@@ -71,6 +79,11 @@ class PforWrapper {
   ///            valid: an all-null page is a bare header.
   /// \param[out] values pointer to output buffer, sized for num_values
   /// \return Status::OK on success, or an error if the data is malformed
+  ///
+  /// The payload layout is not a parameter: it comes from the page's own header,
+  /// so a reader does not have to be told which one a page holds, and a page
+  /// written under a layout this build does not implement is rejected by
+  /// LoadHeader rather than misread.
   static Status Decode(const uint8_t* comp, int64_t comp_size, int32_t num_values,
                        T* values);
 
@@ -99,7 +112,7 @@ class PforWrapper {
  private:
   /// \brief Page header structure (7 bytes)
   struct PforHeader {
-    uint8_t packing_mode;      // 0 = FOR + bit-packing
+    uint8_t packing_mode;      // PackingMode: sequential or interleaved
     uint8_t log_vector_size;   // log2(vector_size)
     uint8_t value_byte_width;  // sizeof(T): 4 or 8
     int32_t num_elements;      // total element count

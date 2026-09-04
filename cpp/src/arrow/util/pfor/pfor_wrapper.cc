@@ -128,7 +128,7 @@ Result<typename PforWrapper<T>::PforHeader> PforWrapper<T>::LoadHeader(
   header.value_byte_width = util::SafeLoadAs<uint8_t>(ptr + 2);
   header.num_elements = bit_util::FromLittleEndian(util::SafeLoadAs<int32_t>(ptr + 3));
 
-  if (header.packing_mode != PforConstants::kPackingModeForBitPack) {
+  if (!IsSupportedPackingMode(header.packing_mode)) {
     return Status::Invalid("PFOR unsupported packing mode: ",
                            static_cast<int>(header.packing_mode));
   }
@@ -145,6 +145,23 @@ Result<typename PforWrapper<T>::PforHeader> PforWrapper<T>::LoadHeader(
   if (header.num_elements < 0) {
     return Status::Invalid("PFOR invalid num_elements: ", header.num_elements);
   }
+  // The interleaved layout is defined for one block of 1024 four-byte values, so
+  // a page that declares it and then declares a vector size or a value width it
+  // can never apply to is self-contradictory. Rejecting it here means the decode
+  // loop never has to ask whether the mode it was handed is reachable.
+  if (header.packing_mode == static_cast<uint8_t>(PackingMode::kForBitPackInterleaved)) {
+    if (header.log_vector_size != PforConstants::kDefaultLogVectorSize) {
+      return Status::Invalid("PFOR interleaved layout needs a vector size of ",
+                             PforConstants::kPforVectorSize,
+                             " but the page declares log_vector_size ",
+                             static_cast<int>(header.log_vector_size));
+    }
+    if (header.value_byte_width != 4) {
+      return Status::Invalid(
+          "PFOR interleaved layout needs 4-byte values but the page declares ",
+          static_cast<int>(header.value_byte_width));
+    }
+  }
   return header;
 }
 
@@ -153,7 +170,7 @@ Result<typename PforWrapper<T>::PforHeader> PforWrapper<T>::LoadHeader(
 
 template <typename T>
 Status PforWrapper<T>::Encode(const T* values, int32_t num_values, int32_t vector_size,
-                              uint8_t* comp, int64_t* comp_size) {
+                              uint8_t* comp, int64_t* comp_size, PackingMode mode) {
   if (num_values < 0) {
     return Status::Invalid("PFOR num_values must be non-negative: ", num_values);
   }
@@ -193,9 +210,20 @@ Status PforWrapper<T>::Encode(const T* values, int32_t num_values, int32_t vecto
 
   uint8_t* dest = comp;
 
+  // A page's layout is one byte in its header, so a request the page cannot
+  // satisfy is answered by writing the layout actually used rather than by
+  // failing: a writer sets the option once for a file and every column type and
+  // vector size then has to encode under it. LoadHeader rejects the combination
+  // this drops, so the downgrade is what keeps the header honest.
+  const PackingMode effective_mode =
+      (mode == PackingMode::kForBitPackInterleaved && sizeof(T) == 4 &&
+       vector_size == static_cast<int32_t>(PforConstants::kPforVectorSize))
+          ? PackingMode::kForBitPackInterleaved
+          : PackingMode::kForBitPack;
+
   // Step 1: Write header
   PforHeader header;
-  header.packing_mode = PforConstants::kPackingModeForBitPack;
+  header.packing_mode = static_cast<uint8_t>(effective_mode);
   header.log_vector_size = log_vector_size;
   header.value_byte_width = sizeof(T);
   header.num_elements = num_values;
@@ -219,8 +247,11 @@ Status PforWrapper<T>::Encode(const T* values, int32_t num_values, int32_t vecto
     int32_t start_idx = v * vector_size;
     int32_t elements_in_vector = std::min(vector_size, num_values - start_idx);
 
-    auto encoded =
-        PforCompression<T>::EncodeVector(values + start_idx, elements_in_vector);
+    // EncodeVector applies the interleaved layout only to a full block, so the
+    // short tail vector of a page falls back on its own; the decoder derives the
+    // same split from the same element count.
+    auto encoded = PforCompression<T>::EncodeVector(values + start_idx,
+                                                    elements_in_vector, effective_mode);
 
     // Serialize to output
     ARROW_ASSIGN_OR_RAISE(
@@ -237,8 +268,8 @@ Status PforWrapper<T>::Encode(const T* values, int32_t num_values, int32_t vecto
 
 template <typename T>
 Status PforWrapper<T>::Encode(const T* values, int32_t num_values, uint8_t* comp,
-                              int64_t* comp_size) {
-  return Encode(values, num_values, kVectorSize, comp, comp_size);
+                              int64_t* comp_size, PackingMode mode) {
+  return Encode(values, num_values, kVectorSize, comp, comp_size, mode);
 }
 
 // ----------------------------------------------------------------------
@@ -303,7 +334,8 @@ Status PforWrapper<T>::Decode(const uint8_t* comp, int64_t comp_size, int32_t nu
 
     ARROW_RETURN_NOT_OK(PforCompression<T>::DecodeVector(
         std::span<const uint8_t>(vector_data, src + comp_size - vector_data),
-        elements_in_vector, values + start_idx));
+        elements_in_vector, values + start_idx,
+        static_cast<PackingMode>(header.packing_mode)));
   }
 
   return Status::OK();
