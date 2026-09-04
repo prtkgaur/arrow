@@ -418,20 +418,28 @@ class FLBADecoder : virtual public TypedDecoder<FLBAType> {
   // then perhaps not
 };
 
+/// \brief Create an encoder for one column.
+///
+/// \param pfor_interleaved_bit_packing EXPERIMENTAL: ask a PFOR encoder for the
+///        lane-interleaved bit-packing layout. Ignored by every other encoding,
+///        and ignored by PFOR itself where the layout cannot apply. See
+///        WriterProperties::Builder::enable_pfor_interleaved_bit_packing.
 PARQUET_EXPORT
 std::unique_ptr<Encoder> MakeEncoder(
     Type::type type_num, Encoding::type encoding, bool use_dictionary = false,
     const ColumnDescriptor* descr = NULLPTR,
-    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
+    bool pfor_interleaved_bit_packing = false);
 
 template <typename DType>
 std::unique_ptr<typename EncodingTraits<DType>::Encoder> MakeTypedEncoder(
     Encoding::type encoding, bool use_dictionary = false,
     const ColumnDescriptor* descr = NULLPTR,
-    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) {
+    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
+    bool pfor_interleaved_bit_packing = false) {
   using OutType = typename EncodingTraits<DType>::Encoder;
-  std::unique_ptr<Encoder> base =
-      MakeEncoder(DType::type_num, encoding, use_dictionary, descr, pool);
+  std::unique_ptr<Encoder> base = MakeEncoder(DType::type_num, encoding, use_dictionary,
+                                              descr, pool, pfor_interleaved_bit_packing);
   return std::unique_ptr<OutType>(dynamic_cast<OutType*>(base.release()));
 }
 

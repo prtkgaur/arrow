@@ -1800,8 +1800,12 @@ class PforEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
   using T = typename DType::c_type;
   using TypedEncoder<DType>::Put;
 
-  explicit PforEncoder(const ColumnDescriptor* descr, MemoryPool* pool)
-      : EncoderImpl(descr, Encoding::PFOR, pool), pool_(pool) {}
+  PforEncoder(const ColumnDescriptor* descr, MemoryPool* pool,
+              ::arrow::util::pfor::PackingMode packing_mode =
+                  ::arrow::util::pfor::PackingMode::kForBitPack)
+      : EncoderImpl(descr, Encoding::PFOR, pool),
+        pool_(pool),
+        packing_mode_(packing_mode) {}
 
   std::shared_ptr<Buffer> FlushValues() override {
     // An all-null optional page adds no values and is still written, so an empty
@@ -1816,7 +1820,7 @@ class PforEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 
     int64_t comp_size = max_size;
     PARQUET_THROW_NOT_OK(::arrow::util::pfor::PforWrapper<T>::Encode(
-        values_.data(), num_values, buffer->mutable_data(), &comp_size));
+        values_.data(), num_values, buffer->mutable_data(), &comp_size, packing_mode_));
 
     PARQUET_THROW_NOT_OK(buffer->Resize(comp_size));
     values_.clear();
@@ -1861,6 +1865,9 @@ class PforEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 
  private:
   MemoryPool* pool_;
+  // The bit-packing layout to ask each page for. Advisory: a page the layout
+  // cannot apply to records the layout PFOR has always used.
+  ::arrow::util::pfor::PackingMode packing_mode_;
   std::vector<T> values_;
 };
 
@@ -1869,7 +1876,8 @@ class PforEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 
 std::unique_ptr<Encoder> MakeEncoder(Type::type type_num, Encoding::type encoding,
                                      bool use_dictionary, const ColumnDescriptor* descr,
-                                     MemoryPool* pool) {
+                                     MemoryPool* pool,
+                                     bool pfor_interleaved_bit_packing) {
   if (use_dictionary) {
     switch (type_num) {
       case Type::INT32:
@@ -1964,11 +1972,18 @@ std::unique_ptr<Encoder> MakeEncoder(Type::type type_num, Encoding::type encodin
             "DELTA_BYTE_ARRAY only supports BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY");
     }
   } else if (encoding == Encoding::PFOR) {
+    // The encoder treats the layout as a request: a column it cannot apply to
+    // records the layout PFOR has always used, so one writer-side setting can
+    // cover a file whose columns are not all eligible.
+    const auto packing_mode =
+        pfor_interleaved_bit_packing
+            ? ::arrow::util::pfor::PackingMode::kForBitPackInterleaved
+            : ::arrow::util::pfor::PackingMode::kForBitPack;
     switch (type_num) {
       case Type::INT32:
-        return std::make_unique<PforEncoder<Int32Type>>(descr, pool);
+        return std::make_unique<PforEncoder<Int32Type>>(descr, pool, packing_mode);
       case Type::INT64:
-        return std::make_unique<PforEncoder<Int64Type>>(descr, pool);
+        return std::make_unique<PforEncoder<Int64Type>>(descr, pool, packing_mode);
       default:
         throw ParquetException("PFOR encoder only supports INT32 and INT64");
     }

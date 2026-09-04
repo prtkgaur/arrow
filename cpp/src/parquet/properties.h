@@ -374,6 +374,7 @@ class PARQUET_EXPORT WriterProperties {
           created_by_(DEFAULT_CREATED_BY),
           store_decimal_as_integer_(false),
           page_checksum_enabled_(false),
+          pfor_interleaved_bit_packing_(false),
           size_statistics_level_(DEFAULT_SIZE_STATISTICS_LEVEL),
           content_defined_chunking_enabled_(false),
           content_defined_chunking_options_({}) {}
@@ -390,6 +391,7 @@ class PARQUET_EXPORT WriterProperties {
           created_by_(properties.created_by()),
           store_decimal_as_integer_(properties.store_decimal_as_integer()),
           page_checksum_enabled_(properties.page_checksum_enabled()),
+          pfor_interleaved_bit_packing_(properties.pfor_interleaved_bit_packing()),
           size_statistics_level_(properties.size_statistics_level()),
           sorting_columns_(properties.sorting_columns()),
           default_column_properties_(properties.default_column_properties()),
@@ -810,6 +812,30 @@ class PARQUET_EXPORT WriterProperties {
       return this;
     }
 
+    /// EXPERIMENTAL: Ask the PFOR encoder for the lane-interleaved bit-packing
+    /// layout, which decodes faster and takes the same number of bytes.
+    ///
+    /// Default disabled. The layout is not yet in the Parquet specification, so
+    /// a file written with it can only be read by an implementation that knows
+    /// it; a reader that does not will reject the page rather than misread it.
+    ///
+    /// This applies to 4-byte columns only, and only to pages whose vectors are
+    /// full. Anything it cannot apply to is written in the layout PFOR has
+    /// always used, so this can be set for a file whose columns are not all
+    /// eligible.
+    Builder* enable_pfor_interleaved_bit_packing() {
+      pfor_interleaved_bit_packing_ = true;
+      return this;
+    }
+
+    /// Write PFOR pages in the bit-packing layout that needs no reader opt-in.
+    ///
+    /// This is the default.
+    Builder* disable_pfor_interleaved_bit_packing() {
+      pfor_interleaved_bit_packing_ = false;
+      return this;
+    }
+
     /// Enable writing page index in general for all columns. Default enabled.
     ///
     /// Writing statistics to the page index disables the old method of writing
@@ -903,7 +929,8 @@ class PARQUET_EXPORT WriterProperties {
           size_statistics_level_, std::move(file_encryption_properties_),
           default_column_properties_, column_properties, data_page_version_,
           store_decimal_as_integer_, std::move(sorting_columns_),
-          content_defined_chunking_enabled_, content_defined_chunking_options_));
+          content_defined_chunking_enabled_, content_defined_chunking_options_,
+          pfor_interleaved_bit_packing_));
     }
 
    private:
@@ -920,6 +947,7 @@ class PARQUET_EXPORT WriterProperties {
     std::string created_by_;
     bool store_decimal_as_integer_;
     bool page_checksum_enabled_;
+    bool pfor_interleaved_bit_packing_;
     SizeStatisticsLevel size_statistics_level_;
 
     std::shared_ptr<FileEncryptionProperties> file_encryption_properties_;
@@ -964,6 +992,12 @@ class PARQUET_EXPORT WriterProperties {
   inline bool store_decimal_as_integer() const { return store_decimal_as_integer_; }
 
   inline bool page_checksum_enabled() const { return page_checksum_enabled_; }
+
+  /// EXPERIMENTAL: whether PFOR pages use the lane-interleaved bit-packing
+  /// layout. See WriterProperties::Builder::enable_pfor_interleaved_bit_packing.
+  inline bool pfor_interleaved_bit_packing() const {
+    return pfor_interleaved_bit_packing_;
+  }
 
   inline bool content_defined_chunking_enabled() const {
     return content_defined_chunking_enabled_;
@@ -1086,7 +1120,7 @@ class PARQUET_EXPORT WriterProperties {
       const std::unordered_map<std::string, ColumnProperties>& column_properties,
       ParquetDataPageVersion data_page_version, bool store_short_decimal_as_integer,
       std::vector<SortingColumn> sorting_columns, bool content_defined_chunking_enabled,
-      CdcOptions content_defined_chunking_options)
+      CdcOptions content_defined_chunking_options, bool pfor_interleaved_bit_packing)
       : pool_(pool),
         dictionary_pagesize_limit_(dictionary_pagesize_limit),
         write_batch_size_(write_batch_size),
@@ -1098,6 +1132,7 @@ class PARQUET_EXPORT WriterProperties {
         parquet_created_by_(created_by),
         store_decimal_as_integer_(store_short_decimal_as_integer),
         page_checksum_enabled_(page_write_checksum_enabled),
+        pfor_interleaved_bit_packing_(pfor_interleaved_bit_packing),
         size_statistics_level_(size_statistics_level),
         file_encryption_properties_(file_encryption_properties),
         sorting_columns_(std::move(sorting_columns)),
@@ -1117,6 +1152,7 @@ class PARQUET_EXPORT WriterProperties {
   std::string parquet_created_by_;
   bool store_decimal_as_integer_;
   bool page_checksum_enabled_;
+  bool pfor_interleaved_bit_packing_;
   SizeStatisticsLevel size_statistics_level_;
 
   std::shared_ptr<FileEncryptionProperties> file_encryption_properties_;
