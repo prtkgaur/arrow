@@ -234,6 +234,16 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
   if (info.bit_width() > 0) {
     const auto unsigned_for = static_cast<UnsignedT>(info.frame_of_reference());
 
+    // The vector kernels load a fixed-size window per step. Use the remaining
+    // page bytes as the read bound so a kernel can process the final step when
+    // its load extends beyond this vector's packed payload.
+    //
+    // `data` runs from this vector to the end of the page, so every byte after
+    // this vector's header is inside the caller's buffer and ours to read.
+    const auto readable_bytes = static_cast<int>(std::min<int64_t>(
+        static_cast<int64_t>(data.size()) - PforVectorInfo<T>::kStoredSize,
+        std::numeric_limits<int>::max()));
+
     if (unsigned_for == 0) {
       // FOR is zero: there is no bias to add, so unpack straight into the
       // output. T and UnsignedT are the same width, so the unsigned bits the
@@ -243,7 +253,8 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
       // still patched below in Step 4.
       arrow::internal::unpack(read_ptr, reinterpret_cast<UnsignedT*>(values),
                               arrow::internal::UnpackOptions{
-                                  static_cast<int>(num_elements), info.bit_width()});
+                                  static_cast<int>(num_elements), info.bit_width(),
+                                  /*bit_offset=*/0, readable_bytes});
     } else {
       // FOR is non-zero: hand it to the unpacker as a bias, so the add happens
       // inside the kernel before its store and the output is traversed once.
@@ -259,7 +270,8 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
       // scratch, and no aliasing question. Exceptions are patched in Step 4.
       arrow::internal::unpack_bias(read_ptr, reinterpret_cast<UnsignedT*>(values),
                                    arrow::internal::UnpackOptions{
-                                       static_cast<int>(num_elements), info.bit_width()},
+                                       static_cast<int>(num_elements), info.bit_width(),
+                                       /*bit_offset=*/0, readable_bytes},
                                    unsigned_for);
     }
 
