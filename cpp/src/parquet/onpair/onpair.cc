@@ -1279,11 +1279,25 @@ size_t DecompressStridedFixed(const StridedDictionary& dict, const uint8_t* pack
   return w;
 }
 
-// Resolve `bits` to a constant for the widths a trained dictionary can produce
-// (kMinDictBits..kMaxDictBits), falling back to the runtime-width loop otherwise so
-// no input is rejected.
+// Resolve `bits` to a constant for the widths a trained dictionary can produce,
+// falling back to the runtime-width loop otherwise so no input is rejected.
+//
+// The ladder used to start at 9 because a dictionary that seeded all 256 bytes could
+// never hold fewer than 256 tokens. Seeding only the bytes a column actually uses
+// removes that floor -- tpch_l_shipmode trains to 36 tokens, six bits -- and those
+// widths were landing on the fallback, which retires codes about 40% slower than a
+// constant width does. A narrower code has less work to do per code, not more, so
+// the widths below 9 belong here too.
 #define ONPAIR_DISPATCH_BITS(bits, CALL, FALLBACK) \
   switch (bits) {                                  \
+    case 1: return CALL(1);                        \
+    case 2: return CALL(2);                        \
+    case 3: return CALL(3);                        \
+    case 4: return CALL(4);                        \
+    case 5: return CALL(5);                        \
+    case 6: return CALL(6);                        \
+    case 7: return CALL(7);                        \
+    case 8: return CALL(8);                        \
     case 9: return CALL(9);                        \
     case 10: return CALL(10);                      \
     case 11: return CALL(11);                      \
