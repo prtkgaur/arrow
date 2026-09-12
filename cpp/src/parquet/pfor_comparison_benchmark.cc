@@ -786,6 +786,7 @@ static void BM_PforRaw64Encode(benchmark::State& state, Gen64 gen) {
 template <typename T>
 static void PforDecodeImpl(benchmark::State& state, GenT<T> gen,
                            const ::arrow::util::pfor::PforEncodeOptions& options = {}) {
+
   const int64_t num_values = state.range(0);
   auto values = gen(num_values);
   const int64_t uncompressed_size = num_values * sizeof(T);
@@ -945,6 +946,29 @@ static void BM_PforDbpDeltaDecode(benchmark::State& state, Gen32 gen) {
 }
 static void BM_PforDbpDelta64Decode(benchmark::State& state, Gen64 gen) {
   PforDeltaLayoutDecodeImpl<PforDeltaLayout::kDeltaBinaryPacked, int64_t>(state, gen);
+}
+
+// ----------------------------------------------------------------------
+
+// The two arms below hold the delta decision fixed so that the bit-packed
+// layout is the only thing separating them. BM_PforDecode above is the shipping
+// default, which lets the planner difference a vector whenever its cost model
+// prefers that; on a sorted or correlated column it does, and the decode then
+// also pays a serial prefix sum. A ratio taken against a layout arm that never
+// deltas therefore measures two decisions at once, not the layout. These two
+// decline delta on both sides, so the ratio between them is a layout result,
+// and it is valid on every column rather than only the ones the planner leaves
+// alone.
+static void BM_PforPlainSeqDecode(benchmark::State& state, Gen32 gen) {
+  PforDecodeImpl<int32_t>(
+      state, gen,
+      {/*delta_enabled=*/false, ::arrow::util::pfor::PackingMode::kForBitPack});
+}
+static void BM_PforPlainInterleavedDecode(benchmark::State& state, Gen32 gen) {
+  PforDecodeImpl<int32_t>(
+      state, gen,
+      {/*delta_enabled=*/false,
+       ::arrow::util::pfor::PackingMode::kForBitPackInterleaved});
 }
 
 // ----------------------------------------------------------------------
@@ -2122,6 +2146,9 @@ static void CustomArgs(benchmark::internal::Benchmark* b) { b->Arg(102400); }
   BENCHMARK_CAPTURE(BM_PforPatchedDeltaDecode, Name, &GenFunc)->Apply(CustomArgs); \
   BENCHMARK_CAPTURE(BM_PforDbpDeltaEncode, Name, &GenFunc)->Apply(CustomArgs);     \
   BENCHMARK_CAPTURE(BM_PforDbpDeltaDecode, Name, &GenFunc)->Apply(CustomArgs);     \
+  BENCHMARK_CAPTURE(BM_PforPlainSeqDecode, Name, &GenFunc)->Apply(CustomArgs);     \
+  BENCHMARK_CAPTURE(BM_PforPlainInterleavedDecode, Name, &GenFunc)                 \
+      ->Apply(CustomArgs);                                                         \
   BENCHMARK_CAPTURE(BM_DeltaBitPackEncode, Name, &GenFunc)->Apply(CustomArgs);     \
   BENCHMARK_CAPTURE(BM_DeltaBitPackDecode, Name, &GenFunc)->Apply(CustomArgs);     \
   BENCHMARK_CAPTURE(BM_DbpAbFull, Name, &GenFunc)->Apply(CustomArgs);              \
