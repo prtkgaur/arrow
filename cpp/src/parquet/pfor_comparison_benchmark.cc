@@ -28,6 +28,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -770,6 +771,32 @@ static void PforEncodeImpl(benchmark::State& state, GenT<T> gen,
   state.counters["compression_ratio"] =
       static_cast<double>(uncompressed_size) / static_cast<double>(comp_size);
 }
+
+// ---------------------------------------------------------------------------
+// One process-wide, 4096-aligned output buffer shared by every decode arm.
+//
+// Output-buffer placement can affect decoder measurements. Sharing one aligned
+// buffer ensures that every variant writes to the same addresses, isolating
+// differences in decoder code.
+//
+// Safe to share: benchmarks in a process run one at a time, and every arm
+// overwrites the whole buffer before reading it back.
+// ---------------------------------------------------------------------------
+template <typename T>
+T* SharedDecodeBuffer(int64_t num_values) {
+  static void* raw = nullptr;
+  static size_t cap = 0;
+  const size_t want = static_cast<size_t>(num_values) * sizeof(T);
+  if (want > cap) {
+    std::free(raw);
+    raw = nullptr;
+    if (posix_memalign(&raw, 4096, want + 4096) != 0) std::abort();
+    cap = want;
+  }
+  std::memset(raw, 0, want);
+  return static_cast<T*>(raw);
+}
+
 static void BM_PforEncode(benchmark::State& state, Gen32 gen) {
   PforEncodeImpl<int32_t>(state, gen);
 }
@@ -800,13 +827,17 @@ static void PforDecodeImpl(benchmark::State& state, GenT<T> gen,
       values.data(), static_cast<int32_t>(num_values), compressed.data(), &comp_size,
       options));
 
-  std::vector<T> decoded(num_values);
+  T* decoded = SharedDecodeBuffer<T>(num_values);
   for (auto _ : state) {
     auto status = ::arrow::util::pfor::PforWrapper<T>::Decode(
-        compressed.data(), comp_size, static_cast<int32_t>(num_values), decoded.data());
+        compressed.data(), comp_size, static_cast<int32_t>(num_values), decoded);
     ARROW_CHECK_OK(status);
     benchmark::ClobberMemory();
   }
+  // The interleaved arms assert their round trip; this one did not, so a plan
+  // change silently producing wrong values would have read as a speedup.
+  ARROW_CHECK(std::equal(decoded, decoded + num_values, values.begin()))
+      << "pfor round trip failed";
 
   state.SetBytesProcessed(state.iterations() * uncompressed_size);
   state.SetItemsProcessed(state.iterations() * num_values);
@@ -1018,13 +1049,13 @@ static void DeltaBitPackDecodeImpl(benchmark::State& state, GenT<T> gen) {
   auto buf = encoder->FlushValues();
   int64_t comp_size = buf->size();
 
-  std::vector<T> decoded(num_values);
+  T* decoded = SharedDecodeBuffer<T>(num_values);
   auto decoder = MakeTypedDecoder<PType>(Encoding::DELTA_BINARY_PACKED);
 
   for (auto _ : state) {
     decoder->SetData(static_cast<int>(num_values), buf->data(),
                      static_cast<int>(buf->size()));
-    decoder->Decode(decoded.data(), static_cast<int>(num_values));
+    decoder->Decode(decoded, static_cast<int>(num_values));
     benchmark::ClobberMemory();
   }
 
@@ -1908,14 +1939,14 @@ static void BM_LaneDeltaDecode(benchmark::State& state, Gen32 gen) {
       values.data(), num_values, buf.data());
   ARROW_CHECK_GT(comp_size, 0);
 
-  std::vector<int32_t> decoded(num_values);
+  int32_t* decoded = SharedDecodeBuffer<int32_t>(num_values);
   fl::LaneDeltaDecode<fl::LaneDeltaOrder::kInterleaved>(buf.data(), num_values,
-                                                        decoded.data());
-  ARROW_CHECK(decoded == values) << "lane delta round trip failed";
+                                                        decoded);
+  ARROW_CHECK(std::equal(decoded, decoded + num_values, values.begin())) << "lane delta round trip failed";
 
   for (auto _ : state) {
     fl::LaneDeltaDecode<fl::LaneDeltaOrder::kInterleaved>(buf.data(), num_values,
-                                                          decoded.data());
+                                                          decoded);
     benchmark::ClobberMemory();
   }
   state.SetBytesProcessed(state.iterations() * uncompressed_size);
@@ -1948,18 +1979,18 @@ static void BM_TposeApiDecode(benchmark::State& state, Gen32 gen) {
   auto buf = encoder->FlushValues();
   const int64_t comp_size = buf->size();
 
-  std::vector<int32_t> decoded(num_values);
+  int32_t* decoded = SharedDecodeBuffer<int32_t>(num_values);
   auto decoder = MakeTypedDecoder<Int32Type>(Encoding::LANE_DELTA);
   decoder->SetData(static_cast<int>(num_values), buf->data(),
                    static_cast<int>(buf->size()));
-  ARROW_CHECK_EQ(decoder->Decode(decoded.data(), static_cast<int>(num_values)),
+  ARROW_CHECK_EQ(decoder->Decode(decoded, static_cast<int>(num_values)),
                  static_cast<int>(num_values));
-  ARROW_CHECK(decoded == values) << "lane delta decoder round trip failed";
+  ARROW_CHECK(std::equal(decoded, decoded + num_values, values.begin())) << "lane delta decoder round trip failed";
 
   for (auto _ : state) {
     decoder->SetData(static_cast<int>(num_values), buf->data(),
                      static_cast<int>(buf->size()));
-    decoder->Decode(decoded.data(), static_cast<int>(num_values));
+    decoder->Decode(decoded, static_cast<int>(num_values));
     benchmark::ClobberMemory();
   }
   state.SetBytesProcessed(state.iterations() * uncompressed_size);
@@ -2012,17 +2043,18 @@ static void TposeDecodeImpl(benchmark::State& state, Gen32 gen) {
       fl::TransposedDeltaEncode<kBases>(values.data(), num_values, buf.data());
   ARROW_CHECK_GT(comp_size, 0);
 
-  std::vector<int32_t> decoded(num_values);
-  fl::TransposedDeltaDecode<kBases, kRepair>(buf.data(), num_values, decoded.data());
+  int32_t* decoded = SharedDecodeBuffer<int32_t>(num_values);
+  fl::TransposedDeltaDecode<kBases, kRepair>(buf.data(), num_values, decoded);
   if constexpr (kRepair != TransposedRepair::kNone) {
-    ARROW_CHECK(decoded == values) << "transposed delta round trip failed";
+    ARROW_CHECK(std::equal(decoded, decoded + num_values, values.begin())) << "transposed delta round trip failed";
   } else {
-    ARROW_CHECK(decoded == TransposeReference(values))
+    ARROW_CHECK(std::equal(decoded, decoded + num_values,
+                            TransposeReference(values).begin()))
         << "transposed delta round trip failed in transposed order";
   }
 
   for (auto _ : state) {
-    fl::TransposedDeltaDecode<kBases, kRepair>(buf.data(), num_values, decoded.data());
+    fl::TransposedDeltaDecode<kBases, kRepair>(buf.data(), num_values, decoded);
     benchmark::ClobberMemory();
   }
   state.SetBytesProcessed(state.iterations() * uncompressed_size);
@@ -2040,6 +2072,12 @@ static void BM_TposePackedDecode(benchmark::State& state, Gen32 gen) {
 // The conforming decoder: adjacent deltas, file order out, one pass over the block.
 static void BM_TposeFusedDecode(benchmark::State& state, Gen32 gen) {
   TposeDecodeImpl<TransposedBaseCoding::kPacked, TransposedRepair::kFused>(state, gen);
+}
+// Also conforming, and the one the wrapper ships: the bit-unpack is folded in
+// too, so the 4 KB scratch block kFused still round-trips never exists.
+static void BM_TposeFusedUnpackDecode(benchmark::State& state, Gen32 gen) {
+  TposeDecodeImpl<TransposedBaseCoding::kPacked, TransposedRepair::kFusedUnpack>(state,
+                                                                                gen);
 }
 // Neither of these is a conforming decoder: they leave the block transposed.
 // Raw-vs-Packed at fixed repair isolates the base stream, and NoRepair-vs-not at
@@ -2078,12 +2116,31 @@ static void InterleavedPforDecodeImpl(benchmark::State& state, Gen32 gen) {
       fl::InterleavedPforEncode<kOrder>(values.data(), num_values, buf.data());
   ARROW_CHECK_GT(comp_size, 0);
 
-  std::vector<int32_t> decoded(num_values);
-  fl::InterleavedPforDecode<kOrder>(buf.data(), num_values, decoded.data());
-  ARROW_CHECK(decoded == values) << "interleaved pfor round trip failed";
+  // kFlOrderRaw deliberately returns the FastLanes order, so its expectation is
+  // the permuted input rather than the input. Checking it against the same
+  // permutation the encoder applied is what keeps this arm honest: without it,
+  // an arm that skipped work entirely would also "pass".
+  std::vector<int32_t> expect = values;
+  if constexpr (kOrder == InterleavedPforOrder::kFlOrderRaw) {
+    const int64_t nblocks = num_values / 1024;
+    for (int64_t b = 0; b < nblocks; ++b) {
+      const int32_t* src = values.data() + b * 1024;
+      int32_t* dst = expect.data() + b * 1024;
+      for (int64_t lane = 0; lane < 32; ++lane) {
+        for (int64_t row = 0; row < 32; ++row) {
+          dst[row * 32 + lane] = src[lane * 32 + row];
+        }
+      }
+    }
+  }
+
+  int32_t* decoded = SharedDecodeBuffer<int32_t>(num_values);
+  fl::InterleavedPforDecode<kOrder>(buf.data(), num_values, decoded);
+  ARROW_CHECK(std::equal(decoded, decoded + num_values, expect.begin()))
+      << "interleaved pfor round trip failed";
 
   for (auto _ : state) {
-    fl::InterleavedPforDecode<kOrder>(buf.data(), num_values, decoded.data());
+    fl::InterleavedPforDecode<kOrder>(buf.data(), num_values, decoded);
     benchmark::ClobberMemory();
   }
   state.SetBytesProcessed(state.iterations() * uncompressed_size);
@@ -2093,6 +2150,15 @@ static void InterleavedPforDecodeImpl(benchmark::State& state, Gen32 gen) {
 }
 static void BM_InterleavedPforDecode(benchmark::State& state, Gen32 gen) {
   InterleavedPforDecodeImpl<InterleavedPforOrder::kFileOrder>(state, gen);
+}
+// Same wire bytes as BM_InterleavedPforFlOrderDecode, but the FastLanes order is
+// handed to the caller unchanged. It runs the identical PackBlock/UnpackBlock
+// pair as BM_InterleavedPforDecode against a grid that was merely filled
+// differently at encode time, so it must measure equal to it -- the arm exists
+// to separate "FL_ORDER's bit-packing is cheaper" (it is not, it is identical)
+// from "FL_ORDER's permutation costs something" (it does).
+static void BM_InterleavedPforFlOrderRawDecode(benchmark::State& state, Gen32 gen) {
+  InterleavedPforDecodeImpl<InterleavedPforOrder::kFlOrderRaw>(state, gen);
 }
 static void BM_InterleavedPforFlOrderDecode(benchmark::State& state, Gen32 gen) {
   InterleavedPforDecodeImpl<InterleavedPforOrder::kFlOrder>(state, gen);
@@ -2165,6 +2231,8 @@ static void CustomArgs(benchmark::internal::Benchmark* b) { b->Arg(102400); }
   BENCHMARK_CAPTURE(BM_DbpGeom1024x8, Name, &GenFunc)->Apply(CustomArgs);          \
   BENCHMARK_CAPTURE(BM_DbpGeom1024x1, Name, &GenFunc)->Apply(CustomArgs);          \
   BENCHMARK_CAPTURE(BM_InterleavedPforDecode, Name, &GenFunc)->Apply(CustomArgs); \
+  BENCHMARK_CAPTURE(BM_InterleavedPforFlOrderRawDecode, Name, &GenFunc)          \
+      ->Apply(CustomArgs);                                                       \
   BENCHMARK_CAPTURE(BM_InterleavedPforFlOrderDecode, Name, &GenFunc)             \
       ->Apply(CustomArgs);                                                      \
   BENCHMARK_CAPTURE(BM_LaneDeltaDecode, Name, &GenFunc)->Apply(CustomArgs);        \
@@ -2173,6 +2241,7 @@ static void CustomArgs(benchmark::internal::Benchmark* b) { b->Arg(102400); }
   BENCHMARK_CAPTURE(BM_TposeRawDecode, Name, &GenFunc)->Apply(CustomArgs);         \
   BENCHMARK_CAPTURE(BM_TposePackedDecode, Name, &GenFunc)->Apply(CustomArgs);      \
   BENCHMARK_CAPTURE(BM_TposeFusedDecode, Name, &GenFunc)->Apply(CustomArgs);       \
+  BENCHMARK_CAPTURE(BM_TposeFusedUnpackDecode, Name, &GenFunc)->Apply(CustomArgs); \
   BENCHMARK_CAPTURE(BM_TposeNoRepairDecode, Name, &GenFunc)->Apply(CustomArgs);    \
   BENCHMARK_CAPTURE(BM_TposeRawNoRepairDecode, Name, &GenFunc)->Apply(CustomArgs); \
   BENCHMARK_CAPTURE(BM_LaneDeltaEncode, Name, &GenFunc)->Apply(CustomArgs);        \
