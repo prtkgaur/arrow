@@ -1612,7 +1612,7 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
   // width that has not been checked, including the non-conformant widths InitBlock
   // tolerates for extraneous miniblocks.
   uint32_t CoalescibleMiniBlocks(uint32_t values_available) const {
-    // Folding in a whole miniblock first requires room for the current one in full.
+    // Folding in a whole miniblock first requires room for the rest of the current one.
     if (values_available < values_remaining_current_mini_block_) {
       return 0;
     }
