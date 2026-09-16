@@ -1,124 +1,112 @@
-# fl5_corpus — 5-arm layout benchmark, portable to aarch64
+# FOR layout and output-footprint microbenchmarks
 
-Two binaries. Build both with `./build.sh`, run both, hand back the four output
-files. Nothing here is x86-specific; `build.sh` picks `-march` from `uname -m`.
-
-## Read this first: the working-set ladder is about to change
-
-**Please build and smoke-test now, but hold the full production run.** Two
-problems with the current three points were found after this harness was written,
-and both are being fixed:
-
-1. **The point labelled `DRAM` is not DRAM.** The x86 reference numbers were
-   taken on a Xeon 6975P-C (Granite Rapids) with **2 MiB of L2 per core and
-   480 MiB of shared L3**. A 32 MiB working set is comfortably L3-resident, so
-   that row measures L3 bandwidth, not memory. Reaching DRAM on that machine
-   needs roughly a gigabyte. Wherever you see `DRAM` in output or in the x86
-   reference files, read it as **L3**, and do not describe those figures as
-   memory-bound in anything you write up.
-2. **The three points bracket the realistic range instead of covering it.** A
-   120 MB file with 100 columns gives ~1.2 MB per column chunk, and integer
-   columns run well under that average — call it 300 KB. Unpacking expands
-   packed bytes by `32/W`, so a 300 KB integer chunk decodes to 300 KB at
-   *W*=32, 600 KB at *W*=16, 1.2 MB at *W*=8 and 2.4 MB at *W*=4. The realistic
-   span is therefore ~300 KB to 2.4 MB, and there is no measurement between
-   400 KiB and 32 MiB.
-
-Points near 1.5 MiB, 4 MiB and ≥1 GiB are being added, plus a concurrency sweep
-(the single-thread numbers give one core the entire L3 and memory controller,
-which a real parallel scan does not). Building and smoke-testing now is still
-worth doing — whether this compiles at all on aarch64 is the open risk, and it is
-independent of which points get measured. **Smoke test with a single dataset**
-(`./fl5_corpus ClientIP /tmp/smoke.csv`) rather than the full corpus, and report
-whether it builds, runs, and exits zero.
+This is a synthetic, single-threaded kernel experiment. The runner targets Linux. It does not load records
+from ClickBench/TPC/NYC datasets, measure production Parquet pages, exceptions,
+delta reconstruction, decompression, or a downstream consumer. Dataset names
+identify generators inspired by those distributions. Compression ratios describe
+those generated values only.
 
 ## Build
 
-The harness now lives in-tree at `<arrow>/fl5_corpus/`, so `build.sh` finds the
-checkout itself. Only the build directory needs pointing at:
+From any directory:
 
 ```bash
-export ARROW_BUILD=/path/to/your/arrow/build   # has src/arrow/util/config.h and
-                                               # release/libarrow.so
-export XSIMD=$ARROW_BUILD/_deps/xsimd-src/include   # optional; this is the default
-./build.sh
+ARROW_BUILD=/path/to/configured/arrow-build \
+XSIMD=/path/to/xsimd/include \
+OUT_DIR=/path/to/new/binaries \
+/path/to/arrow/fl5_corpus/build.sh
 ```
 
-`build.sh` preflights the three headers it needs and fails with a specific
-message naming the missing one, rather than emitting a wall of compiler errors.
-The checkout must be on the branch carrying
-`cpp/src/arrow/util/fastlanes/interleaved_pfor.h` — the harness includes it
-directly.
+The Arrow build must supply `src/arrow/util/config.h` and `release/libarrow.so`
+from compatible sources. `XSIMD` defaults to `$ARROW_BUILD/_deps/xsimd-src/include`;
+set it explicitly when dependencies were reused from another build.
+`OUT_DIR` defaults to this directory. GCC/Clang and C++20 are required.
+On x86 the default flags are `-march=haswell -mprefer-vector-width=256`; on ARM,
+`-march=armv8-a+simd`. `ARCH_FLAGS` can override them. Build flags, source hashes,
+binary hashes and the Arrow CMake cache are recorded in `build-info.json`.
 
-## Run
+The two outputs are `fl5_corpus` and `seq_granularity`. The latter measures
+per-block dispatch versus a whole-buffer call at fixed widths. Its read bounds
+now match the corpus harness. Do not divide corpus results by its ratios: it is
+a diagnostic with different data and framing, not a universal correction factor.
+
+## Verify, then time
 
 ```bash
-# usage: ./fl5_corpus [dataset-filter] [csv-path]
-#   filter "all" (or omitted) runs all 43; any other string is a substring match
-taskset -c 2 ./fl5_corpus all fl5_corpus_arm.csv > fl5_corpus_arm.txt 2> fl5_corpus_arm.err
-taskset -c 2 ./seq_granularity > seq_granularity_arm.txt
-echo "exit=$?"
+ARROW_USER_SIMD_LEVEL=AVX2 taskset -c 2 /path/to/binaries/fl5_corpus all --verify-only
+ARROW_USER_SIMD_LEVEL=AVX2 taskset -c 2 /path/to/binaries/seq_granularity all --verify-only
+
+python3 fl5_corpus/run.py /path/to/binaries/fl5_corpus results-clientip \
+  --dataset ClientIP --core 2 --simd AVX2
+python3 fl5_corpus/gen_tables.py results-clientip/results.csv results-clientip/report.html
 ```
 
-One run produces both the human table (stdout) and the CSV. Pin to a core and
-keep the machine otherwise idle; the whole thing takes a few minutes.
+Choose a CPU in your allowed affinity mask. Keep it and its SMT sibling quiet;
+use consistent power settings and record them. The runner records the command,
+source revision/diff/hashes, binary and linked-library hashes, build information,
+CPU/governor, elapsed time and exit code. It refuses to overwrite an existing
+output directory. `--simd NONE` disables optional SVE on ARM while retaining its mandatory NEON baseline; the fused FL transpose is
+currently AVX2-only, and the ARM fallback must be labelled as such.
 
-`fl5_corpus` exits non-zero if the `fl_unpk`-vs-`intlv` identity check fails, so
-a clean exit is meaningful — please report the exit status. Its header also
-prints which `fl_tpos` implementation was compiled in; on aarch64 expect to see
-the `UNFUSED fallback` banner, which confirms caveat 1 below rather than
-indicating a build problem.
+The binary also accepts `[dataset-filter|all] [output.csv]`, followed by
+`--repetitions=N` (default 7, minimum 3), `--bytes-per-run=N` (default 1 GiB),
+`--seed=N` (default 7), `--min-time-ms=N` (default 100), `--exact`, and
+`--verify-only`. Binary filters are substrings unless `--exact` is supplied;
+the Python runner selects exact names to avoid also matching `NearSortedUnixTime`. Unmatched
+filters and output-file errors fail. Verify-only validates all selected cases
+without timings; its CSV is header-only and cannot be reported as a benchmark.
 
-## What the two binaries are for
+Calibration first selects a fixed iteration count per arm that reaches the
+minimum duration and byte budget. Each repetition shuffles arm order with the recorded seed. Every arm gets the
+same source/destination addresses, a refill outside timing, and one warm pass.
+The raw/grid controls use the same compiled callable with different payloads.
+A compiler memory barrier protects every timed iteration. The table uses median
+throughput and retains individual measurements in `output.csv.raw.csv`, including
+order, duration and iteration count. Runs traverse at least the full source and
+destination rings. Shorter byte budgets are useful for smoke tests, not claims
+about small differences. Repeat processes with a different seed to check stability.
 
-`fl5_corpus` runs five arms over 43 generated columns at three working sets
-(16 KiB / 400 KiB / 32 MiB of output — labelled L1 / L2 / `DRAM`, but see the
-correction at the top: the third is L3):
+Exit 1 indicates an input, I/O or correctness failure. Exit 2 indicates a noisy
+or mismatched-control run: any arm CV exceeds 5%, or `fl_unpk/intlv` lies outside
+`[1/1.05, 1.05]` for any column/point. Results are retained for diagnosis. This
+does not identify the cause: noise, code generation, and memory placement can
+all matter. Do not remove failing columns just to obtain a passing geomean.
 
-| arm | layout | order out |
-|---|---|---|
-| `seq_scal` | continuous LSB-first | file |
-| `seq_simd` | continuous LSB-first | file |
-| `intlv` | interleaved 32×32 | file |
-| `fl_unpk` | interleaved, FL_ORDER | FL_ORDER |
-| `fl_tpos` | interleaved, FL_ORDER | file |
+## What is measured
 
-`intlv` and `fl_unpk` run identical kernel code against grids that were merely
-*filled* differently at encode time, so their speeds must agree — that is the
-harness's self-check, and it should read 1.00x.
+| Point | Decoded bytes per call | Rotating source payload | Rotating decoded output |
+|---|---:|---:|---:|
+| page16k | 16 KiB | one payload | one slice |
+| page256k | 256 KiB | one payload | one slice |
+| page1m | 1 MiB | one payload | one slice |
+| scan4m | 1 MiB | at least 4 MiB per decoder | one slice |
+| scan48m | 1 MiB | at least 48 MiB per decoder | one slice |
+| batch48m | 1 MiB | one payload | 48 MiB |
 
-`seq_granularity` is the calibration probe, and it is **not optional**. On x86 it
-showed that calling Arrow's exported `unpack_bias` once per 1024-value block
-rather than once per buffer costs **1.27x at L1 and L2** — a handicap the
-`seq_simd` arm pays and the header-inlined interleaved arms do not. Without it,
-`intlv/seq_simd` reads 1.43x at L2 when the layout-only effect is ~1.13x. The
-aarch64 ratios need the same correction with a locally-measured divisor; do not
-reuse the x86 1.27x.
+These names are decoded sizes, not encoded page-size guarantees. A rotating
+48 MiB ring can fit in a large LLC; consult the local cache hierarchy. This does
+not flush caches or measure multi-core bandwidth saturation. Source footprints
+count allocated payload bytes (including the sequential arm's 64 readable pad
+bytes), not stride gaps or measured hardware traffic. The CSV separately records
+sequential/grid payload footprints and the address spans including padding.
+Source rings contain distinct copies of the same generated page, not different
+page contents. Per-block sequential metadata is small and reused, unlike inline grid headers;
+that framing difference is part of this implementation comparison.
 
-## Two things to know before interpreting aarch64 results
+`seq_scal` uses generated scalar kernels, `seq_simd` calls Arrow's runtime
+unpacker per 1024 values, and `intlv` uses the standalone grid in file order.
+`fl_unpk` returns permuted values; `fl_tpos` restores file order. All five are
+verified, as is the write-only `pure_st` pattern, at every source/destination
+slot with an output overrun canary. `pure_st` omits the packed-input stream and
+still reads minima and computes values; treat it as a reference, not a proven
+hardware ceiling. Ratios include dispatch, framing and layout implementation.
 
-1. **`fl_tpos` is the unfused fallback on aarch64.** The fused
-   FL_ORDER-to-file-order kernel (`UnpackBlockFlToFileOrder`) is guarded by
-   `ARROW_TRANSPOSED_DELTA_AVX2` and depends on the
-   `vpunpckldq`/`vperm2i128` ladder. On aarch64 the decoder falls back to
-   unpack-into-a-4-KiB-scratch-grid then `Transpose32x32`. On x86 that path
-   measures ~21.6 GiB/s against the fused kernel's 31.30, so **any aarch64
-   `fl_tpos` number is a lower bound**, and it must not be compared against the
-   x86 `fl_tpos` figure as though the same kernel ran. `intlv` and `fl_unpk` are
-   fully portable and carry no such caveat.
-2. **aarch64 never had the AVX-512 dispatch bug.** Arrow's
-   `bpacking_simd_avx512.cc` is 6.26x slower than its AVX2 kernel and 0.67x of
-   scalar, and `ARROW_RUNTIME_SIMD_LEVEL` defaults to `MAX`, so x86 machines
-   preferred it. That is the whole explanation for "PFOR is 30 GB/s on ARM and
-   6 GiB/s on x86" — it is a bug on one side, not an architecture difference.
-   The x86 numbers here were taken with that dispatch capped at 256 bits.
+The production PFOR comparison is separate: see
+`cpp/src/parquet/PFOR_LAYOUT_RERUN.md`. Never divide its production arms by these
+standalone arms and call the result a layout-only effect.
 
-## Files to hand back
-
-`fl5_corpus_arm.txt`, `fl5_corpus_arm.csv`, `fl5_corpus_arm.err`,
-`seq_granularity_arm.txt`. The `.csv` is what generates the document tables
-(`gen_tables.py` consumes it; columns are
-`dataset,point,n,avg_bit_width,cr,seq_scal,seq_simd,intlv,fl_unpk,fl_tpos`).
-
-x86 reference outputs for comparison are checked in alongside:
-`fl5_corpus_x86.{txt,csv}` and `seq_granularity.txt`.
+The checked-in `fl5_corpus_x86.*` and `seq_granularity.txt` are historical results
+from an older harness/schema. Their cache labels and fastest-of-five timings do
+not describe this version. The report generator requires an explicit current CSV and its raw sidecar, verifies the timing
+arithmetic/medians/CVs, and rejects incomplete/duplicate/invalid rows; it does not read those files or
+insert architectural conclusions into the report.

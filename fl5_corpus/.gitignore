@@ -2,3 +2,6 @@
 fl5_corpus
 seq_granularity
 *.o
+
+build-info.json
+__pycache__/
