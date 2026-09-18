@@ -33,6 +33,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -40,6 +41,7 @@
 #include "benchmark/benchmark.h"
 
 #include "arrow/util/bit_stream_utils_internal.h"
+#include "arrow/util/endian.h"
 #include "arrow/util/bpacking_internal.h"
 #include "arrow/util/fastlanes/interleaved_pfor.h"
 #include "arrow/util/fastlanes/lane_delta.h"
@@ -48,6 +50,7 @@
 #include "arrow/util/logging.h"
 #include "arrow/util/pfor/pfor_wrapper_internal.h"
 #include "arrow/util/rle_encoding_internal.h"
+#include "arrow/util/ubsan.h"
 
 #include "parquet/encoding.h"
 #include "parquet/platform.h"
@@ -864,6 +867,88 @@ static void BM_PforPlainInterleavedDecode(benchmark::State& state, Gen32 gen) {
       state, gen,
       {/*delta_enabled=*/false,
        ::arrow::util::pfor::PackingMode::kForBitPackInterleaved});
+}
+
+// Output-footprint experiment: hold the encoded page and block-decoding loop
+// fixed while advancing the destination or reusing its first 1024 int32 values.
+// Page setup/validation is outside timing in both variants. Each block has a
+// compiler memory barrier in both variants so reused stores cannot disappear.
+// There is no timed consumer: this isolates output-buffer reuse, not the cost of
+// a complete query pipeline. Every decoded block is checked before timing.
+template <bool kReuseOutput, ::arrow::util::pfor::PackingMode kMode>
+static void PforOutputFootprintImpl(benchmark::State& state, Gen32 gen) {
+  namespace pf = ::arrow::util::pfor;
+  constexpr int32_t kBlock = 1024;
+  const int32_t n = static_cast<int32_t>(state.range(0));
+  ARROW_CHECK_EQ(n % kBlock, 0);
+  auto values = gen(n);
+  const int64_t max_size = pf::PforWrapper<int32_t>::GetMaxCompressedSize(n).ValueOrDie();
+  std::vector<uint8_t> compressed(max_size);
+  int64_t comp_size = max_size;
+  ARROW_CHECK_OK(pf::PforWrapper<int32_t>::Encode(
+      values.data(), n, compressed.data(), &comp_size, {/*delta_enabled=*/false, kMode}));
+  ARROW_CHECK_EQ(
+      pf::PforWrapper<int32_t>::DecodeElementCount(compressed.data(), comp_size)
+          .ValueOrDie(),
+      n);
+  ARROW_CHECK_EQ(compressed[0], static_cast<uint8_t>(kMode));
+  ARROW_CHECK_EQ(compressed[1], 10);  // log2(1024)
+  const uint8_t* offsets = compressed.data() + pf::PforConstants::kHeaderSize;
+  const int32_t blocks = n / kBlock;
+  auto get_offset = [&](int32_t block) {
+    return ::arrow::bit_util::FromLittleEndian(
+        ::arrow::util::SafeLoadAs<pf::PforConstants::OffsetType>(
+            offsets + block * sizeof(pf::PforConstants::OffsetType)));
+  };
+  int32_t* decoded = SharedDecodeBuffer<int32_t>(kReuseOutput ? kBlock : n);
+  uint32_t previous = 0;
+  for (int32_t b = 0; b < blocks; ++b) {
+    const auto offset = get_offset(b);
+    ARROW_CHECK_GE(offset, blocks * sizeof(pf::PforConstants::OffsetType));
+    ARROW_CHECK_GT(offset, previous);
+    ARROW_CHECK_LT(offset, comp_size - pf::PforConstants::kHeaderSize);
+    previous = offset;
+    const uint8_t* input = offsets + offset;
+    int32_t* dest = decoded + (kReuseOutput ? 0 : b * kBlock);
+    ARROW_CHECK_OK(pf::PforCompression<int32_t>::DecodeVector(
+        std::span<const uint8_t>(input, compressed.data() + comp_size - input), kBlock,
+        dest, kMode));
+    ARROW_CHECK(std::equal(dest, dest + kBlock, values.data() + b * kBlock));
+  }
+  for (auto _ : state) {
+    for (int32_t b = 0; b < blocks; ++b) {
+      const uint8_t* input = offsets + get_offset(b);
+      int32_t* dest = decoded + (kReuseOutput ? 0 : b * kBlock);
+      ARROW_CHECK_OK(pf::PforCompression<int32_t>::DecodeVector(
+          std::span<const uint8_t>(input, compressed.data() + comp_size - input), kBlock,
+          dest, kMode));
+      benchmark::ClobberMemory();
+    }
+  }
+  state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(n) * sizeof(int32_t));
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(n));
+  state.counters["compression_ratio"] =
+      static_cast<double>(n) * sizeof(int32_t) / comp_size;
+  state.counters["compressed_bytes"] = static_cast<double>(comp_size);
+  state.counters["output_buffer_bytes"] = (kReuseOutput ? kBlock : n) * sizeof(int32_t);
+}
+
+static void BM_PforWholeSeqDecode(benchmark::State& state, Gen32 gen) {
+  PforOutputFootprintImpl<false, ::arrow::util::pfor::PackingMode::kForBitPack>(state,
+                                                                                gen);
+}
+static void BM_PforWholeInterleavedDecode(benchmark::State& state, Gen32 gen) {
+  PforOutputFootprintImpl<false,
+                          ::arrow::util::pfor::PackingMode::kForBitPackInterleaved>(state,
+                                                                                    gen);
+}
+static void BM_PforReuseSeqDecode(benchmark::State& state, Gen32 gen) {
+  PforOutputFootprintImpl<true, ::arrow::util::pfor::PackingMode::kForBitPack>(state,
+                                                                               gen);
+}
+static void BM_PforReuseInterleavedDecode(benchmark::State& state, Gen32 gen) {
+  PforOutputFootprintImpl<true, ::arrow::util::pfor::PackingMode::kForBitPackInterleaved>(
+      state, gen);
 }
 
 // ============================================================================
@@ -2119,6 +2204,12 @@ static void LayoutArgs(benchmark::internal::Benchmark* b) {
 
 // Macro to register all algorithms for a given dataset
 #define REGISTER_DATASET(Name, GenFunc)                                            \
+  BENCHMARK_CAPTURE(BM_PforWholeSeqDecode, Name, &GenFunc)->Apply(LayoutArgs);     \
+  BENCHMARK_CAPTURE(BM_PforWholeInterleavedDecode, Name, &GenFunc)                \
+      ->Apply(LayoutArgs);                                                     \
+  BENCHMARK_CAPTURE(BM_PforReuseSeqDecode, Name, &GenFunc)->Apply(LayoutArgs);     \
+  BENCHMARK_CAPTURE(BM_PforReuseInterleavedDecode, Name, &GenFunc)                \
+      ->Apply(LayoutArgs);                                                     \
   BENCHMARK_CAPTURE(BM_PforEncode, Name, &GenFunc)->Apply(CustomArgs);             \
   BENCHMARK_CAPTURE(BM_PforDecode, Name, &GenFunc)->Apply(CustomArgs);             \
   BENCHMARK_CAPTURE(BM_PforPlainSeqDecode, Name, &GenFunc)->Apply(LayoutArgs);     \
