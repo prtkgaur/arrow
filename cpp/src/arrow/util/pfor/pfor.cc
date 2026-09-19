@@ -247,7 +247,7 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
     if (unsigned_for == 0) {
       // FOR is zero: there is no bias to add, so unpack straight into the
       // output. T and UnsignedT are the same width, so the unsigned bits the
-      // unpacker writes ARE the signed values — no scratch buffer and no
+      // unpacker writes are the signed values — no scratch buffer and no
       // second (add-FOR) pass. This is the common case (any column whose
       // minimum is 0) and decodes at the raw unpack speed. Exceptions are
       // still patched below in Step 4.
@@ -256,16 +256,10 @@ Result<int64_t> PforCompression<T>::DecodeVector(std::span<const uint8_t> data,
                                   static_cast<int>(num_elements), info.bit_width(),
                                   /*bit_offset=*/0, readable_bytes});
     } else {
-      // FOR is non-zero: hand it to the unpacker as a bias, so the add happens
-      // inside the kernel before its store and the output is traversed once.
-      // The obvious alternative — unpack, then a second pass adding FOR — is
-      // what this code used to do, and that pass measured 1.47x-2.40x the cost
-      // of the unpack it followed (median 1.68x). A pass that only copies costs
-      // the same as one that adds, so what is paid for is the extra traversal,
-      // not the arithmetic; keeping the scratch buffer small enough to stay in
-      // L1 (it was 4 KB on the stack) did not avoid it.
+      // Fold the non-zero frame into the unpacker's store to avoid a second
+      // traversal of the output.
       //
-      // The add is modular in UnsignedT, so the bits the unpacker stores ARE the
+      // The add is modular in UnsignedT, so the bits the unpacker stores are the
       // signed values, exactly as in the FOR==0 case above — no cast pass, no
       // scratch, and no aliasing question. Exceptions are patched in Step 4.
       arrow::internal::unpack_bias(read_ptr, reinterpret_cast<UnsignedT*>(values),
