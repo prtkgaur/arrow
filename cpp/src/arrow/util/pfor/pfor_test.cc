@@ -846,7 +846,7 @@ TYPED_TEST(PforTest, MaxCompressedSizeBoundHoldsForAdversarialInputs) {
   }
 }
 
-// ======================================================================
+// ----------------------------------------------------------------------
 // Delta Mode and Frame Search Tests
 
 // The mode has to survive every width, not just the ones a plausible column
@@ -926,8 +926,8 @@ TYPED_TEST(PforTest, DeltaVectorDecodesWithoutThePrecedingVector) {
       decoded);
 }
 
-// Two-sided patching. A tight cluster with one value far below it is the case
-// the old frame could not handle: at the minimum, the packed window has to span
+// Two-sided patching. A tight cluster with one value far below it is the case a
+// frame pinned to the minimum cannot handle: the packed window then has to span
 // the whole gap and every value in the cluster pays for it. The frame belongs
 // above the low value, which then becomes an exception like any other.
 TYPED_TEST(PforTest, FrameSitsAboveTheMinimumToPatchALowOutlier) {
