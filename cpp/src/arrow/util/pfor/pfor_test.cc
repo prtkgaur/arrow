@@ -846,7 +846,7 @@ TYPED_TEST(PforTest, MaxCompressedSizeBoundHoldsForAdversarialInputs) {
   }
 }
 
-// ======================================================================
+// ----------------------------------------------------------------------
 // Delta Mode and Frame Search Tests
 
 // The mode has to survive every width, not just the ones a plausible column
