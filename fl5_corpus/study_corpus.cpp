@@ -1,4 +1,4 @@
-// layout_benchmark -- five bit-unpacking layouts, 43 generated columns, six
+// corpus -- five bit-unpacking layouts, 43 generated columns, six
 // working-set sizes.
 //
 // This measures bit-unpacking only. Frame-of-reference addition is present
@@ -59,6 +59,13 @@
 #include "arrow/util/fastlanes/interleaved_pfor.h"
 
 #include "corpus_generators.h"
+
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
 
 namespace fl = arrow::util::fastlanes;
 namespace bp = arrow::internal::bpacking;
@@ -253,7 +260,10 @@ static const Dataset kDatasets[] = {
 #undef DS
 static constexpr size_t kNumDatasets = sizeof(kDatasets) / sizeof(kDatasets[0]);
 
-int main() {
+}  // namespace
+
+
+int RunCorpusStudy(int, char**) {
   // The ladder is built around the unit a Parquet reader actually decodes: one
   // data page, which defaults to 1 MiB of encoded bytes and is therefore always
   // small. A 32-MiB decode call does not occur in any reader, so growing `n` to
@@ -282,13 +292,13 @@ int main() {
 
   // No arguments: every dataset, every working-set point, one fixed CSV beside
   // the text output, so two runs from two machines are directly comparable.
-  FILE* csv = fopen("layout_benchmark.csv", "w");
+  FILE* csv = fopen("corpus.csv", "w");
   if (csv)
     fprintf(csv,
             "dataset,point,n,avg_bit_width,cr,src_mib,dst_mib,seq_scal,seq_simd,"
             "intlv,fl_unpk,fl_tpos,pure_st\n");
 
-  printf("# layout_benchmark -- bit-unpacking only, no delta anywhere\n");
+  printf("# corpus -- bit-unpacking only, no delta anywhere\n");
   printf("# five decoders plus a store-only reference, best-of-%d\n", kReps);
   printf("# pure_st writes the same bytes to the same place with no unpacking.\n"
          "# It is not a ceiling: it is regularly slower than the decoders that\n"

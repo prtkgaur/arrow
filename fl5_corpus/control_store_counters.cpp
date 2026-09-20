@@ -1,7 +1,7 @@
-// store_counters -- hardware counters for the two bit-unpacking layouts at a
+// counters -- hardware counters for the two bit-unpacking layouts at a
 // working set that does not fit in cache.
 //
-// output_width_matrix's residency sweep shows the interleaved container losing to
+// The memory measurement's first sweep shows the interleaved container losing to
 // Parquet's continuous stream once output plus input passes L2, and shows a
 // per-row store-ordering barrier recovering it. That is a claim about the store
 // path, and this file is the counters behind it: written bytes that turn into
@@ -23,7 +23,7 @@
 // event this core does not implement reads zero and is printed as a dash rather
 // than as a measurement.
 //
-// Build with build.sh (./build.sh store_counters).
+// Run as ./layouts counters.
 
 #include <asm/unistd.h>
 #include <linux/perf_event.h>
@@ -39,6 +39,13 @@
 #include <vector>
 
 #include <arrow/util/bpacking_internal.h>
+
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
 
 constexpr size_t kBlk = 1024;
 constexpr unsigned kLanes = 32, kRows = 32, kT = 32;
@@ -202,7 +209,10 @@ static ArmResult Measure(const char* name, const std::function<void()>& run) {
   return r;
 }
 
-int main() {
+}  // namespace
+
+
+int RunStoreCounters(int, char**) {
   std::vector<uint32_t> ref(kN);
   std::mt19937 rng(7 + kW);
   for (auto& v : ref) v = rng() & Mask();
@@ -226,7 +236,7 @@ int main() {
     }
   }
 
-  printf("store_counters -- %u-bit values into 32-bit output, %zu values, "
+  printf("counters -- %u-bit values into 32-bit output, %zu values, "
          "%zu MiB out, %zu MiB in\n",
          kW, kN, kN * sizeof(uint32_t) / (1024 * 1024), kN * kW / 8 / (1024 * 1024));
   printf("Per 1024 values. A dash is an event this core does not implement.\n\n");

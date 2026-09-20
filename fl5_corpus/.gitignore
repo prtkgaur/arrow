@@ -1,6 +1,10 @@
-# Build products, not sources. build.sh names its output after the source, or
-# after OUT=, so every harness and probe binary lands in this directory beside
-# its .cpp and has to be named here.
+# Build products, not sources. build.sh names its output `layouts` unless OUT=
+# says otherwise, and OBJECT= leaves an object file beside its source.
+layouts
+*.o
+
+# Binaries from the earlier one-per-source layout, still on disk in working
+# checkouts.
 corpus_output_width
 corpus_output_width_tv
 dc_o3
@@ -25,7 +29,7 @@ store_counters
 width_ladder
 width_ladder_tv
 width_probe
-*.o
 
 # Stderr from a run. The .txt beside it holds the result worth keeping.
 *.err
+.objects/

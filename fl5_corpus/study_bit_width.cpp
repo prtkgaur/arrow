@@ -1,7 +1,7 @@
-// width_ladder -- the same four layouts as layout_benchmark, but with bit width
+// width -- the same four layouts the corpus measurement uses, but with bit width
 // as the only variable, one point per width from 1 to 32.
 //
-// layout_benchmark answers "how do these layouts compare on realistic columns",
+// The corpus measurement answers "how do these layouts compare on realistic columns",
 // and its columns carry a mix of widths, so its geomean hides the width axis
 // entirely. This file exists because a layout ratio is a function of bit width:
 // a narrow width leaves more of the unpack in shifts and masks, a wide one
@@ -18,7 +18,7 @@
 // format requires: an INT(8) or INT(16) column is stored as INT32 with an
 // annotation, and the logical-type rules let a reader produce the narrower
 // in-memory type. That axis needs a narrower container and a different set of
-// kernels, and output_width_matrix.cpp measures it.
+// kernels, and the output-width measurement covers it.
 //
 //   seq_scal  Parquet's continuous LSB-first stream, Arrow's generated scalar
 //             unpacker.
@@ -34,7 +34,7 @@
 //
 // Every arm is checked bit-exact before anything is timed.
 //
-// Build with build.sh (./build.sh width_ladder); OPT selects the level.
+// Run as ./layouts width; OPT selects the level at build time.
 
 #include <cinttypes>
 #include <cstdio>
@@ -52,6 +52,13 @@
 #include "arrow/util/bpacking_scalar_generated_internal.h"
 #include "arrow/util/fastlanes/interleaved_pfor.h"
 
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
+
 namespace fl = arrow::util::fastlanes;
 namespace bp = arrow::internal::bpacking;
 using fl::InterleavedPforOrder;
@@ -64,7 +71,7 @@ constexpr size_t kBlk = 1024;
 constexpr int kReps = 5;
 // 128 blocks: 512 KiB of int32 output and at most 512 KiB of packed input, so
 // both stay inside this core's 2 MiB L2 at every width. Residency is
-// layout_benchmark's axis, not this file's.
+// the corpus measurement's axis, not this file's.
 constexpr size_t kBlocks = 128;
 constexpr size_t kN = kBlocks * kBlk;
 constexpr size_t kBytesPerRun = 1024u * 1024 * 1024;  // output bytes per timed run
@@ -154,7 +161,7 @@ static SeqPayload EncodeSequential(const std::vector<int32_t>& v) {
   return p;
 }
 
-// One 4096-aligned arena for every buffer, for the reason layout_benchmark
+// One 4096-aligned arena for every buffer, for the reason the corpus measurement
 // states at length: left to a vector each, input- and output-address-mod-4096
 // vary per arm and per width and are a larger effect than the layout difference.
 static uint8_t* Arena(size_t bytes) {
@@ -230,13 +237,16 @@ static void DecodeSeq(const SeqPayload& p, const uint8_t* base, size_t n, int32_
   }
 }
 
-int main() {
+}  // namespace
+
+
+int RunBitWidthStudy(int, char**) {
   g_ghz = MeasureGhz();
   if (g_ghz <= 0.1) {
     fprintf(stderr, "could not measure the core clock on this target\n");
     return 1;
   }
-  printf("width_ladder -- bit width as the only variable, 32-bit output, %zu KiB out\n",
+  printf("width -- bit width as the only variable, 32-bit output, %zu KiB out\n",
          kN * sizeof(int32_t) / 1024);
   printf("Core clock measured at %.2f GHz.\n", g_ghz);
   // Two units from one timing, because they answer different questions: GiB/s is
@@ -244,7 +254,7 @@ int main() {
   // the core retires for it. Output width is fixed at 32 bits here, so the two
   // are a constant factor apart and the ratios are the same in either -- which is
   // exactly what stops being true when output width varies, and is why
-  // output_width_matrix.cpp reports both across that axis too.
+  // the output-width measurement reports both across that axis too.
   printf("Left block is output GiB/s, right block is values per cycle. "
          "fl_unpk/intlv is the\ntiming control and must read 1.00x.\n\n");
   printf("%3s %6s %8s %8s %8s %8s %8s   %7s %7s %7s %7s %7s   %8s %8s %8s %8s\n", "w",

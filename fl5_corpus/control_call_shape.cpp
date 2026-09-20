@@ -1,7 +1,8 @@
 // Does calling unpack_bias once per 1024-value block handicap the sequential decoder?
 //
-// fl5_corpus calls it per block, because with real data every block picks its own
-// width and its own frame-of-reference minimum, so a page decoder has no choice.
+// Every measurement here calls it per block, because with real data every block
+// picks its own width and its own frame-of-reference minimum, so a page decoder
+// has no choice.
 // But Arrow's own pfor.cc measures faster than that, and if the difference is
 // per-call overhead rather than the layout, then fl5's sequential column is unfair
 // and its headline ratio is inflated. Three decoders, same bytes, same width:
@@ -23,6 +24,13 @@
 #include "arrow/util/bpacking_dispatch_internal.h"
 #include "arrow/util/bpacking_simd_internal.h"
 #include "arrow/util/bpacking_simd_kernel_internal.h"
+
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
 
 namespace bp = arrow::internal::bpacking;
 using Clock = std::chrono::steady_clock;
@@ -81,7 +89,10 @@ static void Run(size_t n, double* a, double* b, double* c) {
   *a = best[0]; *b = best[1]; *c = best[2];
 }
 
-int main() {
+}  // namespace
+
+
+int RunCallShapeControl(int, char**) {
   struct P { const char* nm; size_t n; };
   const P pts[] = {{"L1", 4096}, {"L2", 102400}, {"DRAM", 8u << 20}};
   printf("%-5s %2s | %9s %9s %10s | %8s %8s\n", "point", "W", "per_block", "whole_buf",

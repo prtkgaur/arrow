@@ -1,10 +1,11 @@
-// corpus_output_width -- the 43-column corpus decoded into the narrowest output
+// corpus-narrow -- the 43-column corpus decoded into the narrowest output
 // element each column's values allow, against the same columns decoded into
 // 32-bit elements.
 //
-// layout_benchmark measures these columns writing int32, because that is what
-// the C++ reader materialises. output_width_matrix shows that the output element
-// is the axis a layout ratio moves along, but it does it at synthetic widths.
+// The corpus measurement writes int32 for these columns, because that is what the
+// C++ reader materialises. The output-width measurement shows that the output
+// element is the axis a layout ratio moves along, but it does it at synthetic
+// widths.
 // This file joins the two: real column shapes, right-sized output.
 //
 // The rule for "right-sized" is the values, not the residuals. A column whose
@@ -15,8 +16,8 @@
 // of this corpus does not qualify -- that is a result, not a gap.
 //
 // Every arm adds the per-block frame, so these are reader-shaped figures
-// comparable with layout_benchmark's, not the frameless layout figures in
-// output_width_matrix.
+// comparable with the corpus measurement's, not the frameless layout figures in
+// the output-width one.
 //
 //   seq_scal  Parquet's continuous stream, Arrow's generated scalar unpacker.
 //             At narrow output this path unpacks wide and narrows in a second
@@ -30,7 +31,7 @@
 // self-measured clock, and GiB/s of the bytes written. They disagree by design
 // when the output element changes, which is the whole point of the table.
 //
-// Build with build.sh (./build.sh corpus_output_width); OPT selects the level.
+// Run as ./layouts corpus-narrow; OPT selects the level at build time.
 
 #include <algorithm>
 #include <chrono>
@@ -49,6 +50,13 @@
 #include "arrow/util/bpacking_scalar_generated_internal.h"
 #include "corpus_generators.h"
 
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
+
 namespace bp = arrow::internal::bpacking;
 using Clock = std::chrono::steady_clock;
 
@@ -57,7 +65,7 @@ using KernelScalar = arrow::internal::ScalarUnpackerForWidth<U, W>;
 
 constexpr size_t kBlk = 1024;
 // 128 Ki values: 512 KiB of int32 output, less when narrower, so every arm stays
-// inside this core's 2 MiB L2. Residency is layout_benchmark's axis, not this
+// inside this core's 2 MiB L2. Residency is the corpus measurement's axis, not this
 // file's, and the layout advantage is flat across it.
 constexpr size_t kN = 128 * 1024;
 constexpr size_t kBlocks = kN / kBlk;
@@ -388,7 +396,10 @@ struct Dataset {
   std::vector<int32_t> (*gen)(int64_t);
 };
 
-int main() {
+}  // namespace
+
+
+int RunCorpusNarrowStudy(int, char**) {
   g_ghz = MeasureGhz();
   if (g_ghz <= 0.1) {
     fprintf(stderr, "could not measure the core clock\n");
@@ -416,7 +427,7 @@ int main() {
   };
   const size_t nsets = sizeof(sets) / sizeof(sets[0]);
 
-  printf("corpus_output_width -- 43 columns, right-sized output element vs 32-bit\n");
+  printf("corpus-narrow -- 43 columns, right-sized output element vs 32-bit\n");
   printf("Core clock measured at %.2f GHz. %zu values per decode, L2-resident, frame "
          "applied.\n", g_ghz, kN);
   printf("Left block is values per cycle, right block GiB/s of output. narrow: the "

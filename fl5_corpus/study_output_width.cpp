@@ -1,4 +1,4 @@
-// output_width_matrix -- which bit-packing layout decodes fastest, resolved by
+// output -- which bit-packing layout decodes fastest, resolved by
 // both widths that matter: the packed bit width and the output element width.
 //
 // This is a layout question, not an encoding question. There is no frame of
@@ -51,7 +51,8 @@
 // roughly flat while its values per cycle doubles with every halving of the
 // output element. Reading one unit alone hides which of the two is happening.
 //
-// Build with build.sh (./build.sh output_width_matrix); OPT selects the level.
+// Run as ./layouts output for the matrix and ./layouts memory for the two
+// footprint sweeps at the end of this file; OPT selects the level at build time.
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +70,13 @@
 #include "arrow/util/bpacking_scalar_generated_internal.h"
 #include "arrow/util/fastlanes/fastlanes_kernels_internal.h"
 #include "arrow/util/fastlanes/interleaved_pfor.h"
+
+// Everything below is private to this file. One study per translation unit,
+// so a study's kernels are compiled exactly as they were when it was a
+// standalone binary, and two studies can hold the same name for different
+// things.
+namespace {
+
 
 namespace bp = arrow::internal::bpacking;
 namespace fl = arrow::util::fastlanes;
@@ -598,13 +606,22 @@ static void SweepVectorAtATime() {
   }
 }
 
-int main() {
+// Both entry points below need the core clock, because both print values per
+// cycle.
+bool InitClock() {
   g_ghz = MeasureGhz();
   if (g_ghz <= 0.1) {
     fprintf(stderr, "could not measure the core clock on this target\n");
-    return 1;
+    return false;
   }
-  printf("output_width_matrix -- bit unpacking only, no frame, no exceptions\n");
+  return true;
+}
+}  // namespace
+
+int RunOutputWidthStudy(int, char**) {
+  if (!InitClock()) return 1;
+  printf("Output element width against packed width -- bit unpacking only, no frame,\n"
+         "no exceptions.\n");
   printf("Core clock measured at %.2f GHz. %zu values per pass, L1-resident.\n\n", g_ghz,
          g_n);
   Measure(1, 8, Run<uint8_t, 1>());
@@ -631,6 +648,17 @@ int main() {
 
   PrintTable("Values per cycle", /*kGibs=*/false);
   PrintTable("GiB/s of output", /*kGibs=*/true);
+  return 0;
+}
+
+// The two sweeps in this file that vary a footprint rather than a width. They
+// live here because they reuse this file's frameless kernels at fixed widths,
+// which is what makes a footprint the only thing that moves between rows.
+int RunMemoryStudy(int, char**) {
+  if (!InitClock()) return 1;
+  printf("Where the decoded output goes -- bit unpacking only, no frame, no\n"
+         "exceptions.\n");
+  printf("Core clock measured at %.2f GHz.\n", g_ghz);
   SweepResidency();
   SweepVectorAtATime();
   return 0;
