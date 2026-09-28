@@ -327,6 +327,62 @@ Result<int32_t> PforWrapper<T>::DecodeElementCount(const uint8_t* comp,
 }
 
 // ----------------------------------------------------------------------
+// VectorReader
+
+template <typename T>
+Result<typename PforWrapper<T>::VectorReader> PforWrapper<T>::VectorReader::Open(
+    std::span<const uint8_t> input) {
+  ARROW_ASSIGN_OR_RAISE(const PforHeader header, PforWrapper<T>::LoadHeader(input));
+
+  VectorReader reader;
+  reader.input_ = input;
+  reader.num_elements_ = header.num_elements;
+  reader.vector_size_ = 1 << header.log_vector_size;
+  reader.num_vectors_ =
+      static_cast<int32_t>(bit_util::CeilDiv(reader.num_elements_, reader.vector_size_));
+  reader.offset_array_start_ = input.data() + PforConstants::kHeaderSize;
+  const int64_t offset_array_size =
+      static_cast<int64_t>(reader.num_vectors_) * kOffsetSize;
+  if (PforConstants::kHeaderSize + offset_array_size >
+      static_cast<int64_t>(input.size())) {
+    return Status::Invalid("PFOR offset array for ", reader.num_vectors_,
+                           " vectors does not fit in ", input.size(), " bytes");
+  }
+  reader.payload_size_ = static_cast<int64_t>(input.size()) - PforConstants::kHeaderSize;
+  RETURN_NOT_OK(ValidateOffsets(reader.offset_array_start_, reader.num_vectors_,
+                                offset_array_size, reader.payload_size_));
+  return reader;
+}
+
+template <typename T>
+Result<int32_t> PforWrapper<T>::VectorReader::VectorLength(int32_t vector_index) const {
+  if (vector_index < 0 || vector_index >= num_vectors_) {
+    return Status::Invalid("PFOR vector index ", vector_index, " is outside [0, ",
+                           num_vectors_, ")");
+  }
+  return std::min(vector_size_, num_elements_ - vector_index * vector_size_);
+}
+
+template <typename T>
+Status PforWrapper<T>::VectorReader::DecodeVector(int32_t vector_index,
+                                                  std::span<T> output) const {
+  ARROW_ASSIGN_OR_RAISE(const int32_t vector_length, VectorLength(vector_index));
+  if (output.size() < static_cast<size_t>(vector_length)) {
+    return Status::Invalid("PFOR vector output has ", output.size(), " slots but needs ",
+                           vector_length);
+  }
+  const auto offset =
+      bit_util::FromLittleEndian(util::SafeLoadAs<PforConstants::OffsetType>(
+          offset_array_start_ + vector_index * kOffsetSize));
+  const uint8_t* vector_data = offset_array_start_ + offset;
+  return PforCompression<T>::DecodeVector(
+             std::span<const uint8_t>(vector_data,
+                                      input_.data() + input_.size() - vector_data),
+             vector_length, output.data())
+      .status();
+}
+
+// ----------------------------------------------------------------------
 // GetMaxCompressedSize
 
 template <typename T>
