@@ -24,6 +24,8 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -2376,73 +2378,71 @@ class ByteStreamSplitDecoder<FLBAType> : public ByteStreamSplitDecoderBase<FLBAT
 // ----------------------------------------------------------------------
 // PFOR Decoder
 
-// TODO: support incremental decode. Partial reads currently decode the
-// entire page into `decoded_values_` on first call and copy out the
-// requested range; a future revision should decode only the requested
-// values, with state tracking for cross-call resumption. This is deferred
-// to a follow-up change; the encoder carries the matching TODO.
 template <typename DType>
 class PforDecoder : public TypedDecoderImpl<DType> {
  public:
   using Base = TypedDecoderImpl<DType>;
   using T = typename DType::c_type;
+  using VectorReader = typename ::arrow::util::pfor::PforWrapper<T>::VectorReader;
 
-  // TODO: decode a vector at a time. PforWrapper::Decode keeps no resumption
-  // state, so a caller that reads a page in batches decodes the whole page into
-  // `decoded_values_` on the first batch and is served from it afterwards, which
-  // costs a page-sized allocation. The page layout is already addressed by
-  // vector: its offset array locates any vector in constant time, so a batched
-  // read could decode the vectors it needs into a scratch buffer of one vector
-  // and leave the rest of the page untouched.
   explicit PforDecoder(const ColumnDescriptor* descr,
                        MemoryPool* pool = ::arrow::default_memory_pool())
-      : Base(descr, Encoding::PFOR),
-        pool_(pool),
-        decoded_values_(AllocateBuffer(pool, 0)) {}
+      : Base(descr, Encoding::PFOR), cached_vector_(AllocateBuffer(pool, 0)) {}
 
   void SetData(int num_values, const uint8_t* data, int len) override {
+    if (num_values < 0 || len < 0) {
+      throw ParquetException("PFOR SetData: num_values=" + std::to_string(num_values) +
+                             " len=" + std::to_string(len));
+    }
     Base::SetData(num_values, data, len);
-    if (num_values > 0 && len <= 0) {
+    if (num_values > 0 && len == 0) {
       throw ParquetException("PFOR SetData: num_values=" + std::to_string(num_values) +
                              " but len=" + std::to_string(len));
     }
     // A decoder is cached per encoding and reused across the data pages of a
     // column chunk, so every piece of state describing the previous page has to
     // be dropped along with the page itself.
-    scratch_filled_ = false;
+    cached_vector_index_ = -1;
     // `num_values` is the page's level count, which includes nulls, while a PFOR
     // page stores only the non-null values. Its own header is the authority on
     // how many, so take the count from there.
     if (len > 0) {
-      PARQUET_ASSIGN_OR_THROW(total_values_,
-                              ::arrow::util::pfor::PforWrapper<T>::DecodeElementCount(
-                                  this->data_, this->len_));
-      if (total_values_ > num_values) {
-        throw ParquetException("PFOR page declares " + std::to_string(total_values_) +
+      PARQUET_ASSIGN_OR_THROW(
+          reader_, VectorReader::Open({this->data_, static_cast<size_t>(this->len_)}));
+      const int32_t encoded_values = reader_->num_elements();
+      if (encoded_values > num_values) {
+        throw ParquetException("PFOR page declares " + std::to_string(encoded_values) +
                                " values but the page header allows at most " +
                                std::to_string(num_values));
       }
+      this->num_values_ = encoded_values;
     } else {
-      total_values_ = 0;
+      reader_.reset();
+      this->num_values_ = 0;
     }
-    this->num_values_ = total_values_;
+    levels_remaining_ = num_values;
   }
 
   int Decode(T* buffer, int max_values) override {
+    if (ARROW_PREDICT_FALSE(max_values < 0)) {
+      throw ParquetException("PFOR Decode: max_values must be non-negative");
+    }
     max_values = std::min(max_values, this->num_values_);
     if (max_values == 0) return 0;
-
-    // The caller asked for the whole page and none of it has been served yet, so
-    // decode straight into its buffer -- no page-sized scratch and no copy. This
-    // is the path a full column read takes.
-    if (CanDecodeWholePage(max_values)) {
-      PARQUET_THROW_NOT_OK(::arrow::util::pfor::PforWrapper<T>::Decode(
-          this->data_, this->len_, total_values_, buffer));
-    } else {
-      std::memcpy(buffer, NextDecoded(), static_cast<size_t>(max_values) * sizeof(T));
-    }
+    DecodeInternal(buffer, max_values);
     this->num_values_ -= max_values;
+    levels_remaining_ -= max_values;
+    CheckPageConsumed();
     return max_values;
+  }
+
+  int DecodeSpaced(T* buffer, int num_values, int null_count, const uint8_t* valid_bits,
+                   int64_t valid_bits_offset) override {
+    const int decoded =
+        Base::DecodeSpaced(buffer, num_values, null_count, valid_bits, valid_bits_offset);
+    levels_remaining_ -= null_count;
+    CheckPageConsumed();
+    return decoded;
   }
 
   // `num_values` counts output slots; only the non-null ones are backed by
@@ -2466,13 +2466,7 @@ class PforDecoder : public TypedDecoderImpl<DType> {
     //    asks for no values, and a page carrying none has nothing to decode.
     if (values_to_decode > 0) {
       T* decode_out = builder->GetMutableValue(builder->length() + null_count);
-      if (CanDecodeWholePage(values_to_decode)) {
-        PARQUET_THROW_NOT_OK(::arrow::util::pfor::PforWrapper<T>::Decode(
-            this->data_, this->len_, total_values_, decode_out));
-      } else {
-        std::memcpy(decode_out, NextDecoded(),
-                    static_cast<size_t>(values_to_decode) * sizeof(T));
-      }
+      DecodeInternal(decode_out, values_to_decode);
     }
 
     // 2. Expand the values into their final positions.
@@ -2486,6 +2480,8 @@ class PforDecoder : public TypedDecoderImpl<DType> {
       builder->UnsafeAdvance(num_values, valid_bits, valid_bits_offset);
     }
     this->num_values_ -= values_to_decode;
+    levels_remaining_ -= num_values;
+    CheckPageConsumed();
     return values_to_decode;
   }
 
@@ -2497,6 +2493,8 @@ class PforDecoder : public TypedDecoderImpl<DType> {
     if (Decode(values.data(), values_decoded) != values_decoded) {
       ParquetException::EofException();
     }
+    levels_remaining_ -= null_count;
+    CheckPageConsumed();
 
     const T* data = values.data();
     PARQUET_THROW_NOT_OK(out->Reserve(num_values));
@@ -2508,36 +2506,50 @@ class PforDecoder : public TypedDecoderImpl<DType> {
   }
 
  private:
-  /// \brief Whether `count` values can be decoded straight to the caller
-  ///
-  /// PforWrapper::Decode only decodes a page from its start, so this holds when
-  /// the caller wants the whole page and nothing has been served from it yet.
-  bool CanDecodeWholePage(int count) const {
-    return !scratch_filled_ && count == total_values_;
-  }
-
-  /// \brief Pointer to the next undelivered value, decoding the page if needed
-  const T* NextDecoded() {
-    if (!scratch_filled_) {
-      PARQUET_THROW_NOT_OK(
-          decoded_values_->Resize(static_cast<int64_t>(total_values_) * sizeof(T),
-                                  /*shrink_to_fit=*/false));
-      PARQUET_THROW_NOT_OK(::arrow::util::pfor::PforWrapper<T>::Decode(
-          this->data_, this->len_, total_values_, decoded_values_->mutable_data_as<T>()));
-      scratch_filled_ = true;
+  void CheckPageConsumed() const {
+    ARROW_DCHECK_GE(levels_remaining_, 0) << "PFOR decoder consumed too many levels";
+    if (ARROW_PREDICT_FALSE(levels_remaining_ <= 0 && this->num_values_ > 0)) {
+      throw ParquetException("PFOR page has " + std::to_string(this->num_values_) +
+                             " unconsumed values after all levels were read");
     }
-    return decoded_values_->data_as<T>() + (total_values_ - this->num_values_);
   }
 
-  MemoryPool* pool_;
-  /// Values the page's PFOR header declares. The inherited `num_values_` counts
-  /// down from this as values are served and is the only record of progress, so
-  /// the next value sits at index `total_values_ - num_values_`.
-  int32_t total_values_ = 0;
-  // Whole-page scratch, used only by partial reads. Pool-backed so the
-  // allocation is accounted for like the other decoders' scratch space.
-  std::shared_ptr<ResizableBuffer> decoded_values_;
-  bool scratch_filled_ = false;
+  void DecodeInternal(T* output, int count) {
+    const int32_t vector_size = reader_->vector_size();
+    int32_t processed = reader_->num_elements() - this->num_values_;
+    for (int32_t remaining = count; remaining > 0;) {
+      const int32_t vector_index = processed / vector_size;
+      const int32_t position = processed % vector_size;
+      PARQUET_ASSIGN_OR_THROW(const int32_t vector_length,
+                              reader_->VectorLength(vector_index));
+      const int32_t take = std::min(remaining, vector_length - position);
+      if (position == 0 && take == vector_length) {
+        PARQUET_THROW_NOT_OK(reader_->DecodeVector(
+            vector_index, {output, static_cast<size_t>(vector_length)}));
+      } else {
+        if (cached_vector_index_ != vector_index) {
+          PARQUET_THROW_NOT_OK(
+              cached_vector_->Resize(static_cast<int64_t>(vector_length) * sizeof(T),
+                                     /*shrink_to_fit=*/false));
+          PARQUET_THROW_NOT_OK(
+              reader_->DecodeVector(vector_index, {cached_vector_->mutable_data_as<T>(),
+                                                   static_cast<size_t>(vector_length)}));
+          cached_vector_index_ = vector_index;
+        }
+        std::memcpy(output, cached_vector_->data_as<T>() + position,
+                    static_cast<size_t>(take) * sizeof(T));
+      }
+      output += take;
+      processed += take;
+      remaining -= take;
+    }
+  }
+
+  std::optional<VectorReader> reader_;
+  // One vector of pool-backed scratch, reused when a batch begins or ends inside it.
+  std::shared_ptr<ResizableBuffer> cached_vector_;
+  int32_t cached_vector_index_ = -1;
+  int64_t levels_remaining_ = 0;
 };
 
 }  // namespace

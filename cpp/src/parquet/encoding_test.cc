@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <utility>
 #include <vector>
@@ -2226,6 +2227,49 @@ TYPED_TEST(TestPforEncoding, AllNullPage) {
   ASSERT_OK(result->ValidateFull());
   ASSERT_EQ(kNumValues, result->length());
   ASSERT_EQ(kNumValues, result->null_count());
+}
+
+TYPED_TEST(TestPforEncoding, RejectsPageWithUnreadValues) {
+  using c_type = typename TypeParam::c_type;
+  constexpr int kNumValues = 200;
+  constexpr int kNullCount = 30;
+
+  std::vector<c_type> values(kNumValues);
+  std::iota(values.begin(), values.end(), static_cast<c_type>(0));
+  auto encoder =
+      MakeTypedEncoder<TypeParam>(Encoding::PFOR,
+                                  /*use_dictionary=*/false, this->descr_.get());
+  encoder->Put(values.data(), kNumValues);
+  auto encoded = encoder->FlushValues();
+
+  std::vector<uint8_t> valid_bits(bit_util::BytesForBits(kNumValues), 0);
+  for (int i = 0; i < kNumValues - kNullCount; ++i) {
+    bit_util::SetBit(valid_bits.data(), i);
+  }
+  std::vector<c_type> output(kNumValues);
+  auto decoder = MakeTypedDecoder<TypeParam>(Encoding::PFOR, this->descr_.get());
+  decoder->SetData(kNumValues, encoded->data(), static_cast<int>(encoded->size()));
+  ASSERT_THROW(decoder->DecodeSpaced(output.data(), kNumValues, kNullCount,
+                                     valid_bits.data(), /*valid_bits_offset=*/0),
+               ParquetException);
+}
+
+TYPED_TEST(TestPforEncoding, RejectsNegativeArguments) {
+  using c_type = typename TypeParam::c_type;
+  auto decoder = MakeTypedDecoder<TypeParam>(Encoding::PFOR, this->descr_.get());
+  uint8_t byte = 0;
+  ASSERT_THROW(decoder->SetData(-1, &byte, 1), ParquetException);
+  ASSERT_THROW(decoder->SetData(0, &byte, -1), ParquetException);
+
+  auto encoder =
+      MakeTypedEncoder<TypeParam>(Encoding::PFOR,
+                                  /*use_dictionary=*/false, this->descr_.get());
+  const c_type value = 7;
+  encoder->Put(&value, 1);
+  auto encoded = encoder->FlushValues();
+  decoder->SetData(1, encoded->data(), static_cast<int>(encoded->size()));
+  c_type output{};
+  ASSERT_THROW(decoder->Decode(&output, -1), ParquetException);
 }
 
 // ----------------------------------------------------------------------
