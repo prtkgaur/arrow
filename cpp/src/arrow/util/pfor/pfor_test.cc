@@ -309,6 +309,24 @@ TYPED_TEST(PforTest, VectorSimpleSequenceWithoutDelta) {
   EXPECT_EQ(encoded.info().num_exceptions(), 0);
 }
 
+// The research comparison needs a true delta arm even on data for which the
+// normal planner correctly chooses raw PFOR.
+TYPED_TEST(PforTest, ForceDeltaBypassesThePlannerChoice) {
+  using T = TypeParam;
+  std::vector<T> values = this->RandomValues(64, 100, 163, 11);
+  const PforEncodeOptions options{.delta_enabled = true, .force_delta = true};
+  auto encoded = PforCompression<T>::EncodeVector(
+      values.data(), static_cast<int32_t>(values.size()), options);
+  ASSERT_TRUE(encoded.info().is_delta());
+
+  const int64_t size = PforCompression<T>::SerializedVectorSize(encoded, values.size());
+  std::vector<uint8_t> buffer(size);
+  ASSERT_OK(PforCompression<T>::SerializeVector(encoded, values.size(), buffer));
+  std::vector<T> decoded(values.size());
+  ASSERT_OK(PforCompression<T>::DecodeVector(buffer, values.size(), decoded.data()));
+  ASSERT_EQ(values, decoded);
+}
+
 TYPED_TEST(PforTest, VectorWithOutlier) {
   using T = TypeParam;
   std::vector<T> values = {100, 102, 101, 103, 100, 99, 50000, 104};
