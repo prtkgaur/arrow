@@ -36,12 +36,51 @@ namespace pfor {
 /// \class PforWrapper
 /// \brief High-level interface for PFOR page-level compression
 ///
-/// Manages the page layout: [Header 7B] [Offset Array] [Vector 0] [Vector 1] ...
+/// Manages this page layout (offsets are relative to the offset array):
+///
+///   +---------------------------------------------------------------+
+///   | PFOR header (7 bytes)                                         |
+///   | Offset 0 | Offset 1 | ... | Offset n-1      (4 bytes each)    |
+///   | Vector 0 | Vector 1 | ... | Vector n-1                         |
+///   +---------------------------------------------------------------+
+///
+/// Header fields:
+///
+///   +--------+--------------------+---------------------+
+///   | Offset | Field              | Size                |
+///   +--------+--------------------+---------------------+
+///   |      0 | packing_mode       | 1 byte (uint8)      |
+///   |      1 | log_vector_size    | 1 byte (uint8)      |
+///   |      2 | value_byte_width   | 1 byte (uint8)      |
+///   |      3 | num_elements       | 4 bytes (int32)     |
+///   +--------+--------------------+---------------------+
 ///
 /// \tparam T the integer type (int32_t or int64_t)
 template <typename T>
 class PforWrapper {
  public:
+  /// A validated view of one encoded page.  It keeps no decoded values and can
+  /// therefore serve arbitrary vectors without materializing the whole page.
+  class VectorReader {
+   public:
+    static Result<VectorReader> Open(std::span<const uint8_t> input);
+
+    int32_t num_elements() const { return num_elements_; }
+    int32_t vector_size() const { return vector_size_; }
+    int32_t num_vectors() const { return num_vectors_; }
+
+    Result<int32_t> VectorLength(int32_t vector_index) const;
+    Status DecodeVector(int32_t vector_index, std::span<T> output) const;
+
+   private:
+    std::span<const uint8_t> input_;
+    const uint8_t* offset_array_start_ = nullptr;
+    int64_t payload_size_ = 0;
+    int32_t num_elements_ = 0;
+    int32_t vector_size_ = 0;
+    int32_t num_vectors_ = 0;
+  };
+
   /// \brief Encode integer values into a PFOR-compressed page
   ///
   /// \param[in] values pointer to input integers

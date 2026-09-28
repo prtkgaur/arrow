@@ -171,8 +171,15 @@ TEST_F(ParquetPforEncodingTest, MixedTypesWithInt32Int64) {
                           ->build();
 
   std::shared_ptr<Table> result;
-  DoRoundtrip(table, table->num_rows(), &result, writer_props);
+  std::shared_ptr<Buffer> file;
+  DoRoundtrip(table, table->num_rows(), &result, writer_props, &file);
 
+  auto metadata =
+      ParquetFileReader::Open(std::make_shared<BufferReader>(file))->metadata();
+  ASSERT_THAT(metadata->RowGroup(0)->ColumnChunk(0)->encodings(),
+              ::testing::Contains(Encoding::PFOR));
+  ASSERT_THAT(metadata->RowGroup(0)->ColumnChunk(1)->encodings(),
+              ::testing::Contains(Encoding::PFOR));
   ASSERT_NO_FATAL_FAILURE(::arrow::AssertTablesEqual(*table, *result));
 }
 
