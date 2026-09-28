@@ -13,7 +13,8 @@ the aggregate compression ratio.
 
 Both arms restart at exactly the same 1,024-value PFOR vector boundaries. DBPDelta
 uses the canonical DBP layout inside every vector (128-value blocks, four 32-value
-miniblocks), including a new DBP header and first value per vector. Both include the
+miniblocks for INT32; 256-value blocks and four 64-value miniblocks for INT64),
+including a new DBP header and first value per vector. Both include the
 same outer PFOR page header and four-byte vector offsets. Delta mode is forced so the
 PFOR planner cannot silently substitute raw PFOR. A separate forced-raw PFOR run
 classifies a dataset as *delta-beneficial* when PatchedDelta is smaller than raw PFOR;
@@ -52,6 +53,20 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 | INT32 | 30 | 7.256 | 2.283 | **3.18x** |
 | INT64 | 6 | 11.314 | 5.668 | **2.00x** |
 | Combined | 36 | 7.814 | 2.657 | **2.94x** |
+
+## Why PatchedDelta decompresses faster
+
+Both implementations call Arrow's same SIMD `internal::unpack`; the difference is
+the work around it. PatchedDelta has one bit width for a 1,024-value vector, invokes
+the unpacker once, folds its frame bias into that unpack, patches sparse exceptions,
+and makes one prefix-sum pass. DBPDelta divides the same vector into 32 INT32 or 16
+INT64 miniblocks. For each block/miniblock the decoder parses a min delta and width,
+re-enters `BitReader::GetBatch`, and reconstructs each value from the unpacked offset,
+min delta, and previous value. Thus it pays more dispatch/state transitions and more
+reconstruction work while using the same underlying unpack kernel. A control run of
+whole-page DBP versus DBP restarted every 1,024 values retained 95.6% of decode
+throughput, so per-vector header parsing explains only about 4.4%; the miniblock and
+reconstruction path explains the bulk of the measured gap.
 
 ## Recommendation
 
