@@ -1,46 +1,28 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PFOR delta payload layout: PatchedDelta or DBPDelta?</title>
-<style>
-  body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.45;
-          color: #1f2937; max-width: 980px; margin: 36px auto; padding: 0 24px; }
-  h1 { color: #17365d; border-bottom: 2px solid #4f81bd; padding-bottom: 8px; }
-  h2 { color: #244a73; margin-top: 28px; }
-  table { border-collapse: collapse; width: 100%; margin: 12px 0 20px; font-size: 0.92rem; }
-  th { background: #dbe5f1; color: #17365d; }
-  th, td { border: 1px solid #9ca3af; padding: 7px 9px; text-align: right; }
-  th:first-child, td:first-child { text-align: left; }
-  code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
-  @media print { body { margin: 0; max-width: none; } h2 { break-after: avoid; }
-                  table { break-inside: avoid; } }
-</style>
-</head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PFOR delta payload layout</title><style>body{font-family:system-ui,-apple-system,sans-serif;line-height:1.42;color:#1f2937;max-width:1100px;margin:32px auto;padding:0 24px}h1{color:#17365d;border-bottom:2px solid #4f81bd;padding-bottom:8px}h2{color:#244a73;margin-top:26px}table{border-collapse:collapse;width:100%;margin:10px 0 18px;font-size:.88rem}th{background:#dbe5f1;color:#17365d}th,td{border:1px solid #9ca3af;padding:6px 7px;text-align:right}th:first-child,td:first-child{text-align:left}code{background:#f3f4f6;padding:1px 4px;border-radius:3px}pre{background:#f6f8fa;border:1px solid #d1d5db;padding:12px;overflow:auto;line-height:1.25}pre code{padding:0;background:none}@media print{body{margin:0;max-width:none;font-size:9pt}h2{break-after:avoid}table,pre{break-inside:avoid}}</style></head><body>
 <h1>PFOR delta payload layout: PatchedDelta or DBPDelta?</h1>
-<h2>Question and result</h2>
-<p>When PFOR selects delta mode for a 1,024-value vector, should that vector store its
-deltas using PFOR's frame, bit width, and exceptions (<code>PFOR-PatchedDelta</code>), or as an
-independent Parquet DELTA_BINARY_PACKED stream (<code>PFOR-DBPDelta</code>)? The measurements
-favor <strong>PFOR-PatchedDelta</strong>: it is smaller and substantially faster to decompress in
-both dataset classes. DBPDelta encodes faster, but does not improve the read path or
-the aggregate compression ratio.</p>
+<h2>Result</h2>
+<p>When PFOR selects delta mode for a 1,024-value vector, it can store differences with
+PFOR's frame, one bit width, and exceptions (<code>PFOR-PatchedDelta</code>), or put an independent
+Parquet DELTA_BINARY_PACKED stream in that vector (<code>PFOR-DBPDelta</code>). PatchedDelta is
+smaller and remains faster to decompress, but optimizing the existing DBP decoder
+closes much of the decode gap: from 2.62x to <strong>1.65x</strong> on delta-beneficial datasets and
+from 2.95x to <strong>1.61x</strong> on non-beneficial datasets. Thus the original gap was partly an
+implementation gap and partly a layout gap.</p>
 <h2>Method</h2>
-<p>Both arms restart at exactly the same 1,024-value PFOR vector boundaries. DBPDelta
-uses the canonical DBP layout inside every vector (128-value blocks, four 32-value
-miniblocks for INT32; 256-value blocks and four 64-value miniblocks for INT64),
-including a new DBP header and first value per vector. Both include the
-same outer PFOR page header and four-byte vector offsets. Delta mode is forced so the
-PFOR planner cannot silently substitute raw PFOR. A separate forced-raw PFOR run
-classifies a dataset as <em>delta-beneficial</em> when PatchedDelta is smaller than raw PFOR;
-all others are <em>non-beneficial</em>.</p>
-<p>The corpus has 54 generated column cases (39 INT32, 15 INT64), including ClickBench,
-TPC-DS, TPC-H, taxi, timestamp, counter, random-walk, sawtooth, sentinel, and bimodal
-shapes. Each column has 102,400 values. Results are geometric means of five repetitions
-from a Release build compiled with <code>-O3 -DNDEBUG</code>. Compression ratio is uncompressed
-bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/s.</p>
+<p>Both layouts restart at the same 1,024-value PFOR vector boundaries and include the
+same outer page header and four-byte vector offsets. Delta mode is forced. A forced-raw
+PFOR run classifies a case as <em>delta-beneficial</em> when PatchedDelta is smaller than raw
+PFOR. Baseline DBP is Arrow's decoder before the two optimization commits. Optimized
+DBP coalesces adjacent equal-width miniblocks into one unpack call (<code>c3b6f870d6</code>) and
+reconstructs deltas with a SIMD register prefix scan (<code>9dc8d52b17</code>). These are
+decode-only changes, so baseline
+and optimized DBP have identical bytes and encode throughput.</p>
+<p>The corpus has 54 generated cases (39 INT32, 15 INT64), including ClickBench, TPC-DS,
+TPC-H, taxi, timestamp, counter, random-walk, sawtooth, sentinel, and bimodal shapes;
+each has 102,400 values. Results are geometric means of five repetitions from a
+Release build compiled with <code>-O3 -DNDEBUG</code>. Ratios are uncompressed/encoded bytes;
+throughput is uncompressed GB/s.</p>
 <h2>Delta-beneficial datasets</h2>
 <table>
 <thead>
@@ -48,9 +30,9 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <th>Compression</th>
 <th style="text-align: right;">Cases</th>
 <th style="text-align: right;">PatchedDelta ratio</th>
-<th style="text-align: right;">DBPDelta ratio</th>
-<th style="text-align: right;">PatchedDelta size vs DBP</th>
-<th style="text-align: right;">Size wins</th>
+<th style="text-align: right;">Baseline DBP ratio</th>
+<th style="text-align: right;">Optimized DBP ratio</th>
+<th style="text-align: right;">Patched size vs DBP</th>
 </tr>
 </thead>
 <tbody>
@@ -59,24 +41,24 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <td style="text-align: right;">9</td>
 <td style="text-align: right;">8.150</td>
 <td style="text-align: right;">5.303</td>
+<td style="text-align: right;">5.303</td>
 <td style="text-align: right;">65.1%</td>
-<td style="text-align: right;">8/9</td>
 </tr>
 <tr>
 <td>INT64</td>
 <td style="text-align: right;">9</td>
 <td style="text-align: right;">12.447</td>
 <td style="text-align: right;">8.055</td>
+<td style="text-align: right;">8.055</td>
 <td style="text-align: right;">64.7%</td>
-<td style="text-align: right;">6/9</td>
 </tr>
 <tr>
 <td>Combined</td>
 <td style="text-align: right;">18</td>
 <td style="text-align: right;">10.072</td>
 <td style="text-align: right;">6.536</td>
+<td style="text-align: right;">6.536</td>
 <td style="text-align: right;"><strong>64.9%</strong></td>
-<td style="text-align: right;">14/18</td>
 </tr>
 </tbody>
 </table>
@@ -86,31 +68,39 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <th>Decompression</th>
 <th style="text-align: right;">Cases</th>
 <th style="text-align: right;">PatchedDelta GB/s</th>
-<th style="text-align: right;">DBPDelta GB/s</th>
-<th style="text-align: right;">PatchedDelta speedup</th>
+<th style="text-align: right;">Baseline DBP GB/s</th>
+<th style="text-align: right;">Optimized DBP GB/s</th>
+<th style="text-align: right;">Patched vs baseline</th>
+<th style="text-align: right;">Patched vs optimized</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>INT32</td>
 <td style="text-align: right;">9</td>
-<td style="text-align: right;">7.450</td>
+<td style="text-align: right;">7.481</td>
 <td style="text-align: right;">2.338</td>
-<td style="text-align: right;"><strong>3.19x</strong></td>
+<td style="text-align: right;">4.338</td>
+<td style="text-align: right;">3.20x</td>
+<td style="text-align: right;"><strong>1.72x</strong></td>
 </tr>
 <tr>
 <td>INT64</td>
 <td style="text-align: right;">9</td>
-<td style="text-align: right;">12.912</td>
+<td style="text-align: right;">12.976</td>
 <td style="text-align: right;">6.055</td>
-<td style="text-align: right;"><strong>2.13x</strong></td>
+<td style="text-align: right;">8.198</td>
+<td style="text-align: right;">2.14x</td>
+<td style="text-align: right;"><strong>1.58x</strong></td>
 </tr>
 <tr>
 <td>Combined</td>
 <td style="text-align: right;">18</td>
-<td style="text-align: right;">9.808</td>
+<td style="text-align: right;">9.852</td>
 <td style="text-align: right;">3.763</td>
-<td style="text-align: right;"><strong>2.61x</strong></td>
+<td style="text-align: right;">5.964</td>
+<td style="text-align: right;">2.62x</td>
+<td style="text-align: right;"><strong>1.65x</strong></td>
 </tr>
 </tbody>
 </table>
@@ -121,9 +111,9 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <th>Compression</th>
 <th style="text-align: right;">Cases</th>
 <th style="text-align: right;">PatchedDelta ratio</th>
-<th style="text-align: right;">DBPDelta ratio</th>
-<th style="text-align: right;">PatchedDelta size vs DBP</th>
-<th style="text-align: right;">Size wins</th>
+<th style="text-align: right;">Baseline DBP ratio</th>
+<th style="text-align: right;">Optimized DBP ratio</th>
+<th style="text-align: right;">Patched size vs DBP</th>
 </tr>
 </thead>
 <tbody>
@@ -132,24 +122,24 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <td style="text-align: right;">30</td>
 <td style="text-align: right;">2.999</td>
 <td style="text-align: right;">2.927</td>
+<td style="text-align: right;">2.927</td>
 <td style="text-align: right;">97.6%</td>
-<td style="text-align: right;">29/30</td>
 </tr>
 <tr>
 <td>INT64</td>
 <td style="text-align: right;">6</td>
 <td style="text-align: right;">2.113</td>
 <td style="text-align: right;">2.107</td>
+<td style="text-align: right;">2.107</td>
 <td style="text-align: right;">99.7%</td>
-<td style="text-align: right;">5/6</td>
 </tr>
 <tr>
 <td>Combined</td>
 <td style="text-align: right;">36</td>
 <td style="text-align: right;">2.829</td>
 <td style="text-align: right;">2.771</td>
+<td style="text-align: right;">2.771</td>
 <td style="text-align: right;"><strong>97.9%</strong></td>
-<td style="text-align: right;">34/36</td>
 </tr>
 </tbody>
 </table>
@@ -159,53 +149,94 @@ bytes divided by encoded bytes; higher is better. Throughput is uncompressed GB/
 <th>Decompression</th>
 <th style="text-align: right;">Cases</th>
 <th style="text-align: right;">PatchedDelta GB/s</th>
-<th style="text-align: right;">DBPDelta GB/s</th>
-<th style="text-align: right;">PatchedDelta speedup</th>
+<th style="text-align: right;">Baseline DBP GB/s</th>
+<th style="text-align: right;">Optimized DBP GB/s</th>
+<th style="text-align: right;">Patched vs baseline</th>
+<th style="text-align: right;">Patched vs optimized</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>INT32</td>
 <td style="text-align: right;">30</td>
-<td style="text-align: right;">7.256</td>
+<td style="text-align: right;">7.297</td>
 <td style="text-align: right;">2.283</td>
-<td style="text-align: right;"><strong>3.18x</strong></td>
+<td style="text-align: right;">4.399</td>
+<td style="text-align: right;">3.20x</td>
+<td style="text-align: right;"><strong>1.66x</strong></td>
 </tr>
 <tr>
 <td>INT64</td>
 <td style="text-align: right;">6</td>
-<td style="text-align: right;">11.314</td>
+<td style="text-align: right;">11.280</td>
 <td style="text-align: right;">5.668</td>
-<td style="text-align: right;"><strong>2.00x</strong></td>
+<td style="text-align: right;">8.009</td>
+<td style="text-align: right;">1.99x</td>
+<td style="text-align: right;"><strong>1.41x</strong></td>
 </tr>
 <tr>
 <td>Combined</td>
 <td style="text-align: right;">36</td>
-<td style="text-align: right;">7.814</td>
+<td style="text-align: right;">7.847</td>
 <td style="text-align: right;">2.657</td>
-<td style="text-align: right;"><strong>2.94x</strong></td>
+<td style="text-align: right;">4.861</td>
+<td style="text-align: right;">2.95x</td>
+<td style="text-align: right;"><strong>1.61x</strong></td>
 </tr>
 </tbody>
 </table>
-<h2>Why PatchedDelta decompresses faster</h2>
-<p>Both implementations call Arrow's same SIMD <code>internal::unpack</code>; the difference is
-the work around it. PatchedDelta has one bit width for a 1,024-value vector, invokes
-the unpacker once, folds its frame bias into that unpack, patches sparse exceptions,
-and makes one prefix-sum pass. DBPDelta divides the same vector into 32 INT32 or 16
-INT64 miniblocks. For each block/miniblock the decoder parses a min delta and width,
-re-enters <code>BitReader::GetBatch</code>, and reconstructs each value from the unpacked offset,
-min delta, and previous value. Thus it pays more dispatch/state transitions and more
-reconstruction work while using the same underlying unpack kernel. A control run of
-whole-page DBP versus DBP restarted every 1,024 values retained 95.6% of decode
-throughput, so per-vector header parsing explains only about 4.4%; the miniblock and
-reconstruction path explains the bulk of the measured gap.</p>
+<h2>Layout: where the remaining work comes from</h2>
+<p>Every bracket below is inside one independently decodable 1,024-value PFOR vector.</p>
+<pre><code class="language-text">PFOR-PatchedDelta
++----------------+-------+----------------------+---------------------------+
+| frame,width,   | first | 1,024 packed offsets | sparse exception positions|
+| delta flag,... | value | at ONE bit width     | and exception differences |
++----------------+-------+----------------------+---------------------------+
+                    one unpack call                 patch before prefix sum
+
+PFOR-DBPDelta (INT32; INT64 has 4 blocks and 16 miniblocks)
++------------+-------+----------------------------------------------------+
+| DBP header | first | 8 blocks x [min_delta | 4 widths | 4 miniblocks]   |
++------------+-------+----------------------------------------------------+
+                        32 miniblocks; widths may change at each boundary
+</code></pre>
+<p>DBP's block metadata can represent four local widths without exceptions, but decoding
+must observe those boundaries. Optimized DBP removes avoidable overhead within that
+layout; it cannot turn unequal-width miniblocks, or miniblocks in different blocks,
+into PatchedDelta's single-width run.</p>
+<h2>Decode pseudocode</h2>
+<pre><code class="language-text">PatchedDelta(vector):
+  read one frame, width, start value, and exception list
+  unpack_bias(all 1,024 offsets, width, frame)       // one unpack invocation
+  patch sparse exception differences
+  values = prefix_sum(differences, start)            // one scalar pass today
+
+BaselineDBP(vector):
+  for each block:
+    read min_delta and four widths
+    for each miniblock:
+      GetBatch(one miniblock, its width)              // 32/16 invocations total
+      for each delta: value = previous + min_delta + offset
+
+OptimizedDBP(vector):
+  for each block:
+    read min_delta and four widths
+    coalesce adjacent miniblocks having the same width
+    for each equal-width run: GetBatch(run, width)    // fewer, data-dependent calls
+    SIMD inclusive_scan(offsets + min_delta, carry)  // register prefix scan
+</code></pre>
+<p>Both layouts ultimately use Arrow's SIMD unpack kernels. The two DBP commits prove
+that implementation mattered: optimized DBP is 1.59x faster than baseline on the
+beneficial class and 1.83x faster on the non-beneficial class. PatchedDelta still wins
+because its metadata selects one width for the whole vector, its frame bias is fused
+into one unpack, and only sparse exceptions intervene before one prefix sum. DBP still
+parses per-block minima and widths and executes a data-dependent number of unpack
+runs. A separate control found that restarting DBP every 1,024 values retains 95.6%
+of whole-page DBP throughput, so repeated vector headers account for only about 4.4%.</p>
 <h2>Recommendation</h2>
-<p>Keep the current per-vector planner and <code>PFOR-PatchedDelta</code> payload. On columns where
-delta mode helps, PatchedDelta is 35.1% smaller and 2.61x faster to decompress than
-DBPDelta. Even when delta mode should not be selected, PatchedDelta remains 2.1%
-smaller and 2.94x faster. DBPDelta's advantage is encode throughput: 1.87x faster on
-the beneficial class and 1.60x faster on the non-beneficial class. That trade is not
-enough to replace the current layout for a storage encoding optimized for compression
-and repeated reads.</p>
-</body>
-</html>
+<p>Keep <code>PFOR-PatchedDelta</code>. On delta-beneficial data it is 35.1% smaller and 1.65x faster
+to decompress than optimized DBPDelta; on non-beneficial data it is 2.1% smaller and
+1.61x faster. DBPDelta encodes 1.87x and 1.59x faster respectively, but the optimized
+decode results show that neither the baseline 2.6-3.0x result nor a claim that both
+delta layouts should perform alike is accurate.</p>
+</body></html>
