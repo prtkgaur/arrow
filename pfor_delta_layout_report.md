@@ -1,5 +1,28 @@
 # PFOR delta payload layout: PatchedDelta or DBPDelta?
 
+## What the three variants are
+
+All three variants first turn the original values into differences between adjacent
+values. They differ in how those differences are stored and decoded:
+
+- **PFOR-PatchedDelta** is the current PFOR delta layout. Each independently decodable
+  1,024-value vector selects one frame and one bit width. Most differences are stored
+  as fixed-width offsets from that frame; differences that do not fit are stored as
+  exceptions and patched before the prefix sum reconstructs the original values.
+- **PFOR-DBPDelta (baseline DBP)** replaces that per-vector PFOR payload with a
+  canonical Parquet DELTA_BINARY_PACKED stream. For INT32 it divides the vector into
+  eight 128-value blocks and 32 miniblocks; for INT64 it uses four 256-value blocks and
+  16 miniblocks. Every block stores a minimum difference and every miniblock can use a
+  different bit width. The baseline Arrow decoder unpacks and reconstructs one
+  miniblock at a time.
+- **PFOR-DBPDelta (optimized DBP)** has exactly the same bytes and compression ratio as
+  baseline DBP. Only its decoder changes: it combines adjacent equal-width miniblocks
+  into larger unpack calls and uses an SIMD register prefix scan to reconstruct values.
+
+Consequently, this comparison separates two questions: whether PFOR's patched,
+single-width layout is preferable to DBP's block/miniblock layout, and how much of the
+original speed difference came from DBP decoder implementation rather than the format.
+
 ## Result
 
 When PFOR selects delta mode for a 1,024-value vector, it can store differences with

@@ -1,6 +1,27 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PFOR delta payload layout</title><style>body{font-family:system-ui,-apple-system,sans-serif;line-height:1.42;color:#1f2937;max-width:1100px;margin:32px auto;padding:0 24px}h1{color:#17365d;border-bottom:2px solid #4f81bd;padding-bottom:8px}h2{color:#244a73;margin-top:26px}table{border-collapse:collapse;width:100%;margin:10px 0 18px;font-size:.88rem}th{background:#dbe5f1;color:#17365d}th,td{border:1px solid #9ca3af;padding:6px 7px;text-align:right}th:first-child,td:first-child{text-align:left}code{background:#f3f4f6;padding:1px 4px;border-radius:3px}pre{background:#f6f8fa;border:1px solid #d1d5db;padding:12px;overflow:auto;line-height:1.25}pre code{padding:0;background:none}@media print{body{margin:0;max-width:none;font-size:9pt}h2{break-after:avoid}table,pre{break-inside:avoid}}</style></head><body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PFOR delta payload layout</title><style>body{font-family:system-ui,-apple-system,sans-serif;line-height:1.42;color:#1f2937;max-width:1100px;margin:32px auto;padding:0 24px}h1{color:#17365d;border-bottom:2px solid #4f81bd;padding-bottom:8px}h2{color:#244a73;margin-top:26px}table{border-collapse:collapse;width:100%;margin:10px 0 18px;font-size:.88rem}th{background:#dbe5f1;color:#17365d}th,td{border:1px solid #9ca3af;padding:6px 7px;text-align:right}th:first-child,td:first-child{text-align:left}code{background:#f3f4f6;padding:1px 4px;border-radius:3px}pre{background:#f6f8fa;border:1px solid #d1d5db;padding:12px;overflow:auto;line-height:1.25}pre code{padding:0;background:none}li{margin:5px 0}@media print{body{margin:0;max-width:none;font-size:9pt}h2{break-after:avoid}table,pre{break-inside:avoid}}</style></head><body>
 <h1>PFOR delta payload layout: PatchedDelta or DBPDelta?</h1>
+<h2>What the three variants are</h2>
+<p>All three variants first turn the original values into differences between adjacent
+values. They differ in how those differences are stored and decoded:</p>
+<ul>
+<li><strong>PFOR-PatchedDelta</strong> is the current PFOR delta layout. Each independently decodable
+  1,024-value vector selects one frame and one bit width. Most differences are stored
+  as fixed-width offsets from that frame; differences that do not fit are stored as
+  exceptions and patched before the prefix sum reconstructs the original values.</li>
+<li><strong>PFOR-DBPDelta (baseline DBP)</strong> replaces that per-vector PFOR payload with a
+  canonical Parquet DELTA_BINARY_PACKED stream. For INT32 it divides the vector into
+  eight 128-value blocks and 32 miniblocks; for INT64 it uses four 256-value blocks and
+  16 miniblocks. Every block stores a minimum difference and every miniblock can use a
+  different bit width. The baseline Arrow decoder unpacks and reconstructs one
+  miniblock at a time.</li>
+<li><strong>PFOR-DBPDelta (optimized DBP)</strong> has exactly the same bytes and compression ratio as
+  baseline DBP. Only its decoder changes: it combines adjacent equal-width miniblocks
+  into larger unpack calls and uses an SIMD register prefix scan to reconstruct values.</li>
+</ul>
+<p>Consequently, this comparison separates two questions: whether PFOR's patched,
+single-width layout is preferable to DBP's block/miniblock layout, and how much of the
+original speed difference came from DBP decoder implementation rather than the format.</p>
 <h2>Result</h2>
 <p>When PFOR selects delta mode for a 1,024-value vector, it can store differences with
 PFOR's frame, one bit width, and exceptions (<code>PFOR-PatchedDelta</code>), or put an independent
