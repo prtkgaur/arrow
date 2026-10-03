@@ -1601,6 +1601,25 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
     values_remaining_current_mini_block_ = values_per_mini_block_;
   }
 
+  // Adjacent miniblocks at the same width form one bitstream because each holds a
+  // multiple of 32 values. The current width was validated by InitMiniBlock.
+  uint32_t CoalescibleMiniBlocks(uint32_t values_available) const {
+    // A run can only start once there is room for the rest of the current miniblock.
+    if (values_available < values_remaining_current_mini_block_) {
+      return 0;
+    }
+    const uint8_t* bit_widths = delta_bit_widths_->data();
+    uint32_t values_needed = values_remaining_current_mini_block_;
+    uint32_t count = 0;
+    while (mini_block_idx_ + count + 1 < mini_blocks_per_block_ &&
+           bit_widths[mini_block_idx_ + count + 1] == delta_bit_width_ &&
+           values_available - values_needed >= values_per_mini_block_) {
+      values_needed += values_per_mini_block_;
+      ++count;
+    }
+    return count;
+  }
+
   int GetInternal(T* buffer, int max_values) {
     max_values = static_cast<int>(std::min<int64_t>(max_values, total_values_remaining_));
     if (max_values == 0) {
@@ -1642,8 +1661,18 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
         }
       }
 
-      int values_decode = std::min(values_remaining_current_mini_block_,
-                                   static_cast<uint32_t>(max_values - i));
+      const uint32_t values_available = static_cast<uint32_t>(max_values - i);
+      const uint32_t values_this_mini_block =
+          std::min(values_remaining_current_mini_block_, values_available);
+      // Zero-width miniblocks bypass unpacking; coalescing them measured slower.
+      const uint32_t mini_blocks_coalesced =
+          delta_bit_width_ == 0 ? 0 : CoalescibleMiniBlocks(values_available);
+      // A non-empty run implies the current miniblock is fully drained, which the
+      // cursor update below relies on.
+      DCHECK(mini_blocks_coalesced == 0 ||
+             values_this_mini_block == values_remaining_current_mini_block_);
+      const int values_decode = static_cast<int>(
+          values_this_mini_block + mini_blocks_coalesced * values_per_mini_block_);
       if (delta_bit_width_ == 0) {
         // Fast path that avoids a back-to-back dependency between two consecutive
         // computations: we know all deltas decode to zero. We actually don't
@@ -1669,7 +1698,9 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
         }
         last_value_ = static_cast<T>(last);
       }
-      values_remaining_current_mini_block_ -= values_decode;
+      // The last miniblock of a coalesced run becomes the current one, fully drained.
+      mini_block_idx_ += mini_blocks_coalesced;
+      values_remaining_current_mini_block_ -= values_this_mini_block;
       i += values_decode;
     }
     total_values_remaining_ -= max_values;
