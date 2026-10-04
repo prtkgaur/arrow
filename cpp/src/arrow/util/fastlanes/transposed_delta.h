@@ -266,12 +266,12 @@ inline size_t TransposedMaxEncodedSize(size_t n) {
 
 #define TPOSE_PACK_CASE(W)   \
   case W:                    \
-    PackBlock<W>(grid, dst); \
+    PackBlock<uint32_t, W>(grid, dst); \
     break;
 
 #define TPOSE_UNPACK_CASE(W)               \
   case W:                                  \
-    UnpackBlock<W, true>(src, grid, bias); \
+    UnpackBlock<uint32_t, W, true>(src, grid, bias); \
     break;
 
 #define TPOSE_FUSED_UNPACK_CASE(W)                                                 \

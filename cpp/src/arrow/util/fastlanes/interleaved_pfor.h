@@ -108,17 +108,17 @@ inline size_t InterleavedPforMaxEncodedSize(size_t n) {
 
 #define ILP_PACK_CASE(W)     \
   case W:                    \
-    PackBlock<W>(grid, dst); \
+    PackBlock<uint32_t, W>(grid, dst); \
     break;
 
 #define ILP_UNPACK_CASE(W)                \
   case W:                                 \
-    UnpackBlock<W, true>(src, dst, bias); \
+    UnpackBlock<uint32_t, W, true>(src, dst, bias); \
     break;
 
 #define ILP_UNPACK_SCRATCH_CASE(W)            \
   case W:                                     \
-    UnpackBlock<W, true>(src, scratch, bias);  \
+    UnpackBlock<uint32_t, W, true>(src, scratch, bias);  \
     break;
 
 #define ILP_UNPACK_FUSED_CASE(W)                            \
@@ -229,7 +229,7 @@ ARROW_FORCE_INLINE void FlUnpackTile(const uint32_t* ARROW_RESTRICT packed,
 #define ARROW_FASTLANES_FUSED_FL_UNPACK 1
 
 // Unpacks a block that was packed in FL_ORDER and writes it in file order,
-// adding `bias` on the way through. Equivalent to UnpackBlock<w, true> into a
+// adding `bias` on the way through. Equivalent to UnpackBlock<uint32_t, w, true> into a
 // scratch grid followed by Transpose32x32, without the grid.
 template <uint32_t w, bool kHasBias>
 inline void UnpackBlockFlToFileOrder(const uint32_t* ARROW_RESTRICT packed,
@@ -291,7 +291,7 @@ ARROW_FORCE_INLINE void FlUnpackTileNeon(const uint32_t* ARROW_RESTRICT packed,
 #define ARROW_FASTLANES_FUSED_FL_UNPACK 1
 
 // Unpacks a block that was packed in FL_ORDER and writes it in file order,
-// adding `bias` on the way through. Equivalent to UnpackBlock<w, true> into a
+// adding `bias` on the way through. Equivalent to UnpackBlock<uint32_t, w, true> into a
 // scratch grid followed by Transpose32x32, without the grid.
 template <uint32_t w, bool kHasBias>
 inline void UnpackBlockFlToFileOrder(const uint32_t* ARROW_RESTRICT packed,
