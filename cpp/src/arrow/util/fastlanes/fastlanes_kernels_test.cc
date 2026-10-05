@@ -23,6 +23,8 @@
 #include <vector>
 
 #include "arrow/util/fastlanes/fastlanes_kernels_internal.h"
+#include "arrow/util/fastlanes/interleaved_pfor.h"
+#include "arrow/util/fastlanes/transposed_delta.h"
 
 namespace arrow::util::fastlanes {
 
@@ -111,6 +113,36 @@ TYPED_TEST(FastlanesKernelsTest, RoundTripsEveryWidth) {
     EXPECT_EQ(in, out) << "w=" << w;
   });
 }
+
+#ifdef ARROW_FASTLANES_FUSED_FL_UNPACK
+// UnpackBlockFlToFileOrder claims to equal an UnpackBlock into a scratch grid
+// followed by Transpose32x32, with the permutation done in registers instead.
+// That is the claim a caller depends on when it picks the fused kernel over the
+// grid, and the two are separate implementations of it, so comparing them is a
+// real check rather than a kernel agreeing with itself. 32-bit only, which is
+// why this is not one of the typed tests above.
+TEST(FastlanesFileOrderTest, MatchesTheGridAndTransposeAtEveryWidth) {
+  using G = BlockGeometry<uint32_t>;
+  ForEachWidth<uint32_t>([](auto w_const) {
+    constexpr uint32_t w = decltype(w_const)::value;
+    const auto in = RandomValues<uint32_t>(w, 311u * w + 7u);
+    std::vector<uint32_t> packed(w * G::kLanes, kDirty<uint32_t>);
+    PackBlock<uint32_t, w>(in.data(), packed.data());
+
+    std::vector<uint32_t> grid(kBlockSize, 0);
+    std::vector<int32_t> expected(kBlockSize, 0);
+    UnpackBlock<uint32_t, w, false>(packed.data(), grid.data());
+    Transpose32x32(grid.data(), expected.data());
+
+    std::vector<int32_t> actual(kBlockSize, 0);
+    UnpackBlockFlToFileOrder<w, false>(packed.data(), actual.data());
+
+    for (size_t i = 0; i < kBlockSize; ++i) {
+      ASSERT_EQ(actual[i], expected[i]) << "w=" << w << " i=" << i;
+    }
+  });
+}
+#endif
 
 // The bias is folded into the unpack so a frame-of-reference decoder needs no
 // second pass. It is modular in the element type, matching the subtraction the
