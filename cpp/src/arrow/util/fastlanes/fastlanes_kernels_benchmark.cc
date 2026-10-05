@@ -267,11 +267,20 @@ ARROW_NOINLINE void DecodePage(const T* packed, T* out, size_t num_blocks) {
 
 // The same packed block delivered in file order instead. UnpackBlock writes the
 // values where the container holds them, which is the order InterleavedPforOrder
-// calls kFlOrderRaw: a reader that wants a column in file order still owes the
-// 32x32 permutation, and this is the decoder that pays it. Where the fused
-// kernel exists the permutation happens in registers; otherwise the grid is
-// materialized and read back, which is the fallback InterleavedPforDecode takes.
-// Both are 32-bit only, so there is no file-order row at u8 or u16.
+// calls kFlOrderRaw, and this is the decoder that permutes that order back.
+//
+// What it prices is the FastLanes lane assignment, not file order as such. The
+// order is settled when the grid is filled: kFileOrder fills it in input order
+// and the same UnpackBlock then writes file order owing no permutation, which
+// is what interleaved_pfor.h:396 means by "kFileOrder owes no permutation".
+// Only a consumer of bytes packed with the lane assignment -- transposed delta
+// -- has to pay this. A plain bit-packed column does not, and neither does
+// production's kForBitPackInterleaved, which has no lane-assignment mode.
+//
+// Where the fused kernel exists the permutation happens in registers; otherwise
+// the grid is materialized and read back, which is the fallback
+// InterleavedPforDecode takes. Both are 32-bit only, so there is no row here at
+// u8 or u16 -- a limit on this column, not on what a reader can consume.
 template <uint32_t w>
 ARROW_NOINLINE void DecodePageFileOrder(const uint32_t* packed, int32_t* out,
                                         size_t num_blocks) {
