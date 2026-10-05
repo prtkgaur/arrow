@@ -402,17 +402,39 @@ constexpr size_t kWidthSweepOutBytes = 16 * 1024;
 constexpr size_t kFootprintLadderKiB[] = {16,  32,  48,   64,   128,
                                           256, 512, 1024, 2048, 4096};
 
-// One width per element size, each far from the degenerate cell where the bit
-// width equals the output width and the decode is a vectorized copy.
+template <uint32_t... Ws>
+void RegisterLadderWidths(size_t out_bytes, size_t kib) {
+  (RegisterWidth<Ws>(out_bytes, "out", kib), ...);
+}
+
+// The widths the footprint axis walks, and the column shape each one stands
+// for. Dictionary indices set most of them: an index is as wide as the
+// cardinality needs, so a few hundred distinct values pack into a byte, a few
+// thousand into a short, and a few hundred thousand into a 32-bit element.
+// One-byte and two-byte output each carry both a width where Arrow's
+// sequential kernel is healthy and one where it collapses, so a row cannot be
+// read as a property of the element size when it is a property of the kernel
+// at that width. Four-byte output collapses at no width this ladder covers,
+// so both of its widths are healthy ones.
+//
+//    3 -> u8    a status enum, or a dictionary of eight or fewer values
+//    4 -> u8    the same shape at a healthy width
+//    7 -> u8    a dictionary of up to 128 values
+//   11 -> u16   a dictionary of a couple of thousand values
+//   12 -> u16   the same shape at a healthy width
+//   14 -> u16   a date held as a day offset, or a dictionary near 16k
+//   18 -> u32   a key offset by its row group minimum
+//   21 -> u32   the same shape three bits wider
+//
+// No width here equals its output width, where the decode is a vectorized copy
+// rather than an unpack.
 void RegisterFootprintLadder() {
   for (size_t kib : kFootprintLadderKiB) {
-    // The width sweep already holds these three widths at its own pin, under
-    // the same name, so registering that size here would run it twice and
-    // print two rows a reader keyed by name cannot tell apart.
+    // The width sweep already holds these widths at its own pin, under the same
+    // name, so registering that size here would run it twice and print two rows
+    // a reader keyed by name cannot tell apart.
     if (kib * 1024 == kWidthSweepOutBytes) continue;
-    RegisterWidth<3>(kib * 1024, "out", kib);
-    RegisterWidth<11>(kib * 1024, "out", kib);
-    RegisterWidth<21>(kib * 1024, "out", kib);
+    RegisterLadderWidths<3, 4, 7, 11, 12, 14, 18, 21>(kib * 1024, kib);
   }
 }
 
